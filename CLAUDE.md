@@ -35,7 +35,7 @@ If you change the quantization, the flatten order, the safetensors metadata keys
   `GlobalWriter` / streamed broadcast; `fs` + `s3` backends (`ROGER_SERVER_STORAGE`).
 - `roger_server/secure_agg.py`, `roger_server/delta.py` — the mirrored client contract (above).
 - `roger_server/__main__.py` — `python -m roger_server` (uvicorn).
-- `Dockerfile`, `DEPLOY.md` — scale-to-zero container deploy (see DEPLOY.md).
+- `Dockerfile`, `README.md` — scale-to-zero container deploy (the README is also the deploy guide).
 - `tests/test_server.py` — CPU-only, download-free; simulates clients with the real `secure_agg` crypto.
 
 ## Architecture notes (read before assuming)

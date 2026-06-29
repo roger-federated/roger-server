@@ -4,7 +4,7 @@
 # PYTHONPATH rather than `pip install .` to keep the image minimal.
 #
 # Build from the REPO ROOT:   docker build -t roger-agg .
-# Run (scale-to-zero, S3):    see DEPLOY.md — the durable global lives in object storage, not on disk.
+# Run (scale-to-zero, S3):    see README.md — the durable global lives in object storage, not on disk.
 FROM python:3.13-slim
 
 RUN pip install --no-cache-dir \
