@@ -32,7 +32,7 @@ python -m roger_server         # serve (uvicorn on 0.0.0.0:8000)
 ## Relationship to the client
 The gradient-sharing client lives in the separate `roger-federated` repo. This server never imports the
 client; they interoperate purely over HTTP. The secure-aggregation + ΔW wire format is mirrored by hand
-in `roger_server/secure_agg.py` and `roger_server/delta.py`; see `CLAUDE.md` for what must stay in
+in `roger_server/secure_agg.py` and `roger_server/delta.py`; see `AGENTS.md` for what must stay in
 lockstep across the two repos.
 
 ## What you need
