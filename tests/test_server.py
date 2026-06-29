@@ -322,6 +322,22 @@ def test_default_quorum_is_three(tmp_path):
     print("PASS test_default_quorum_is_three")
 
 
+def test_allowlist_reports_unsupported(tmp_path):
+    # An allowlisted model keeps the density logic; an excluded one reports "unsupported" at /status so
+    # the client can warn + skip rather than waste a densify+upload the 403/400 would reject anyway.
+    from fastapi.testclient import TestClient
+    from roger_server.app import create_app
+    agg = Aggregator(str(tmp_path), allowlist={"ok"})
+    assert agg.mode("ok", now=0.0) == "bootstrap"
+    assert agg.mode("nope", now=0.0) == "unsupported"
+    with TestClient(create_app(agg)) as client:
+        assert client.get("/status", params={"model_id": "nope"}).json()["mode"] == "unsupported"
+        assert client.get("/status", params={"model_id": "ok"}).json()["mode"] == "bootstrap"
+    # No allowlist ⇒ every model is supported (never "unsupported").
+    assert Aggregator(str(tmp_path), allowlist=None).mode("anything", now=0.0) == "bootstrap"
+    print("PASS test_allowlist_reports_unsupported")
+
+
 def test_absent_global(tmp_path):
     assert store.open_global_reader(str(tmp_path), "nope") is None   # never-folded model ⇒ None, not a crash
     assert store.open_global_stream(str(tmp_path), "nope") is None
@@ -399,3 +415,4 @@ if __name__ == "__main__":
     test_dp_bootstrap_accumulates(d / "i"); test_dp_bootstrap_norm_bound_and_rejects(d / "j")
     test_mode_flips_at_density_threshold(d / "k"); test_default_quorum_is_three(d / "l")
     test_absent_global(d / "m"); test_dp_bootstrap_bf16(d / "n")
+    test_allowlist_reports_unsupported(d / "o")

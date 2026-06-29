@@ -85,8 +85,13 @@ class Aggregator:
     # --- mode / density ---------------------------------------------------------------------
 
     def mode(self, model_id: str, now: float) -> str:
-        """"busy" (secure-agg cohorts) once >= busy_threshold distinct contributors fall inside the
-        busy_window, else "bootstrap" (async DP). Prunes the window in passing."""
+        """"unsupported" when an allowlist is set and excludes this model — surfaced here (not only as the
+        register/contribute 403) so a client can warn the user up front + skip, instead of wasting a
+        session's densify+upload on a gradient no federation will take. Else "busy" (secure-agg cohorts)
+        once >= busy_threshold distinct contributors fall inside the busy_window, else "bootstrap" (async
+        DP). Prunes the window in passing."""
+        if self.allowlist is not None and model_id not in self.allowlist:
+            return "unsupported"                # permanent + actionable, unlike a transient seal failure
         seen = self.recent.get(model_id)
         if not seen:
             return "bootstrap"
