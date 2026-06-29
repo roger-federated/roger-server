@@ -33,11 +33,11 @@ instructions below are deliberately platform-agnostic; map them onto your provid
 1. **Build and push the image.** Build context is the repo root, then tag and push to your registry
    (example values are a real Scaleway registry namespace; substitute your own):
    ```bash
-   docker build -f src/roger/federated/server/Dockerfile -t roger-agg .
+   docker build -t roger-agg .
    docker tag  roger-agg rg.nl-ams.scw.cloud/roger-containers/roger-agg:latest
    docker push rg.nl-ams.scw.cloud/roger-containers/roger-agg:latest
    ```
-   The image bundles CPU-only PyTorch + boto3 and runs `python -m roger.federated.server` (uvicorn on
+   The image bundles CPU-only PyTorch + boto3 and runs `python -m roger_server` (uvicorn on
    `0.0.0.0:8000`).
 2. **Create the bucket** and an access key/secret for it. Keep it **private** (clients reach the global
    only through the server, never the bucket) and leave **versioning off** (the server overwrites one
@@ -168,7 +168,7 @@ docker run -d --name roger-agg --restart unless-stopped \
     -p 127.0.0.1:8000:8000 -v roger-agg-data:/data \
     -e ROGER_SERVER_STORAGE=fs -e ROGER_SERVER_DATA=/data roger-agg
 ```
-Without Docker: `pip install -e ".[server]"` then `python -m roger.federated.server`. Front it with a
+Without Docker: `pip install -e .` then `python -m roger_server`. Front it with a
 reverse proxy that provisions TLS — Caddy is simplest. Point an `A`/`AAAA` record at the VM, open
 inbound 80 (cert challenge) and 443, and use a minimal `/etc/caddy/Caddyfile`:
 ```

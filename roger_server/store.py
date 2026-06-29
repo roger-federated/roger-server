@@ -310,7 +310,7 @@ def global_writer(datadir: str, model_id: str, specs: list):
 
 
 def _compat(specs: list) -> str:
-    from roger.federated import delta
+    from roger_server import delta
     return delta.compat_from_shapes({key: tuple(shape) for key, _, shape in specs})
 
 

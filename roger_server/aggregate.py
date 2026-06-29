@@ -21,8 +21,8 @@ import json, uuid
 
 import torch
 
-from roger.federated import secure_agg
-from roger.federated.server import store
+from roger_server import secure_agg
+from roger_server import store
 
 
 class Round:
@@ -199,7 +199,7 @@ class Aggregator:
             return pre
         if not deltas:
             return "empty delta"
-        from roger.federated import delta as delta_mod
+        from roger_server import delta as delta_mod
         round_id, slot = "dp-" + uuid.uuid4().hex, "u"
         w = store.stage_writer(self.datadir, round_id, slot)
         w.write(delta_mod.to_bytes(deltas, model_id))

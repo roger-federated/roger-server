@@ -24,8 +24,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from roger.federated.server import store
-from roger.federated.server.aggregate import Aggregator
+from roger_server import store
+from roger_server.aggregate import Aggregator
 
 _STAGE_BATCH = 8 << 20                 # bytes buffered before an off-thread store write (caps RAM/upload)
 

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roger-server"
+version = "0.1.0"
+description = "Roger Federated — aggregation server for federated LoRA gradient sharing."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",          # CPU-only is enough: the server does NO inference, just int64 sums + safetensors I/O
+    "safetensors",    # the on-the-wire ΔW blob format (delta.py / store.py)
+    "cryptography",   # X25519 EC-DH pairwise secrets for secure aggregation (secure_agg.py)
+    "fastapi",
+    "uvicorn",
+    "boto3",          # S3 object-storage backend for the scale-to-zero deploy (ROGER_SERVER_STORAGE=s3)
+]
+
+[project.optional-dependencies]
+test = ["pytest", "moto", "httpx"]  # moto mocks S3; httpx backs fastapi's TestClient
+
+[tool.setuptools.packages.find]
+include = ["roger_server*"]

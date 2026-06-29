@@ -1,4 +1,4 @@
-"""`python -m roger.federated.server` — serve the app with uvicorn.
+"""`python -m roger_server` — serve the app with uvicorn.
 
 Host/port from ROGER_SERVER_HOST/PORT (default 0.0.0.0:8000). TLS is terminated in front of this
 process (by the managed platform on a scale-to-zero deploy, or a reverse proxy on a legacy VM; see
@@ -9,7 +9,7 @@ import os
 
 import uvicorn
 
-from roger.federated.server.app import create_app
+from roger_server.app import create_app
 
 if __name__ == "__main__":
     uvicorn.run(create_app(),
