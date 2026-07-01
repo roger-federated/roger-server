@@ -1,7 +1,10 @@
 """app.py — FastAPI wire layer for the aggregation server.
 
 Endpoints the client's transport.py speaks:
-  GET  /status?model_id=  -> {mode, k_min, k_target}   (which regime to use; see aggregate.mode())
+  GET  /status?model_id=  -> {mode, k_min, k_target, min_client, latest_client}   (which regime to use,
+                         see aggregate.mode(); min_client/latest_client advertise the client protocol
+                         version this deployment requires/prefers — ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT,
+                         both default 0 = no opinion — so an out-of-date client self-skips + nudges an update)
   POST /round/register   {model_id, pubkey(hex)} -> {round_id, peers:[hex,...]}   (long-polls until the
                          cohort seals; 503 if it stays below k_min so the client skips — an empty peer
                          set would make the client upload UNMASKED, leaking its ΔW).
@@ -52,6 +55,11 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
     )
     register_window = float(os.environ.get("ROGER_AGG_W", "20"))   # < client 30s register timeout
     collect_window = float(os.environ.get("ROGER_AGG_U", "20"))    # how long to wait for all uploads
+    # Client protocol version this deployment requires (hard floor: older clients self-skip contributing)
+    # and prefers (advisory update notice). 0 = no opinion, so raising the floor is a config change, not
+    # a client-logic redeploy. See client.CLIENT_VERSION / probe_federations.
+    min_client = int(os.environ.get("ROGER_MIN_CLIENT", "0"))
+    latest_client = int(os.environ.get("ROGER_LATEST_CLIENT", "0"))
     trusted = [ipaddress.ip_network(c.strip()) for c in
                os.environ.get("ROGER_AGG_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,10.0.0.0/8").split(",") if c.strip()]
 
@@ -88,7 +96,17 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
     async def status(model_id: str = ""):
         async with cond:
             return {"mode": agg.mode(model_id, time.monotonic()),
-                    "k_min": agg.k_min, "k_target": agg.k_target}
+                    "k_min": agg.k_min, "k_target": agg.k_target,
+                    "min_client": min_client, "latest_client": latest_client}
+
+    @app.get("/healthz")
+    async def healthz():
+        # Touch the store (write+read+delete) so a misconfigured backend surfaces HERE with the real
+        # reason, instead of only as an opaque 500 on the first contribution (reads fail-soft to 204).
+        res = await run_in_threadpool(store.health_check, agg.datadir)
+        if res == "ok":
+            return {"storage": "ok", "backend": os.environ.get("ROGER_SERVER_STORAGE", "fs")}
+        raise HTTPException(503, f"storage check failed: {res}")
 
     @app.post("/contribute_dp")
     async def contribute_dp(req: Request):
@@ -127,7 +145,10 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
 
     @app.post("/round/register")
     async def register(req: Request):
-        body = await req.json()
+        try:
+            body = await req.json()
+        except Exception:
+            raise HTTPException(400, "invalid JSON body")   # don't 500 on a malformed body
         model_id, pubkey = body.get("model_id", ""), body.get("pubkey", "")
         if not model_id or not pubkey:
             raise HTTPException(400, "model_id and pubkey required")

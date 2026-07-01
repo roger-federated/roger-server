@@ -152,6 +152,8 @@ ROGER_AGG_IPBIND=0                               # managed platform: no stable p
 | `ROGER_AGG_IPBIND` | `1` | Reject an upload whose source IP never registered (best-effort only). Set `0` on managed platforms without a stable proxy CIDR. |
 | `ROGER_AGG_MODELS` | *(any)* | Comma-separated `model_id` allowlist; empty accepts any base model. Scope which models a deployment serves (e.g. to bound per-round S3 I/O for very large models; see memory sizing). |
 | `ROGER_AGG_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,10.0.0.0/8` | Proxies whose `X-Forwarded-For` is trusted for the real client IP. On managed platforms prefer `ROGER_AGG_IPBIND=0` over widening this. |
+| `ROGER_MIN_CLIENT` | `0` | Minimum client protocol version (`CLIENT_VERSION`) this deployment accepts. Clients below it self-skip contributing and tell the user to update; `0` = no floor. Raise it after a breaking protocol change so stale clients stop poisoning the global. |
+| `ROGER_LATEST_CLIENT` | `0` | Newest client version to advertise. A client below it (but at/above `ROGER_MIN_CLIENT`) prints an advisory "update available" notice without being blocked; `0` = no notice. |
 
 ## Notes & limits
 - **Cold-start is handled by bootstrap mode.** While a model has fewer than `BUSY_THRESHOLD` recent

@@ -338,6 +338,45 @@ def test_allowlist_reports_unsupported(tmp_path):
     print("PASS test_allowlist_reports_unsupported")
 
 
+def test_status_advertises_client_version(tmp_path, monkeypatch):
+    # /status echoes the deployment's client-version policy (ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT) so
+    # an out-of-date client self-skips + nudges an update. Absent env ⇒ 0 (no opinion), never blocks.
+    from fastapi.testclient import TestClient
+    from roger_server.app import create_app
+    agg = Aggregator(str(tmp_path))
+    with TestClient(create_app(agg)) as client:
+        body = client.get("/status", params={"model_id": "m"}).json()
+        assert body["min_client"] == 0 and body["latest_client"] == 0
+    monkeypatch.setenv("ROGER_MIN_CLIENT", "3")
+    monkeypatch.setenv("ROGER_LATEST_CLIENT", "5")
+    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+        body = client.get("/status", params={"model_id": "m"}).json()
+        assert body["min_client"] == 3 and body["latest_client"] == 5
+    print("PASS test_status_advertises_client_version")
+
+
+def test_healthz_reports_store(tmp_path):
+    # /healthz exercises the write+read+delete path; fs backend is always healthy here.
+    from fastapi.testclient import TestClient
+    from roger_server.app import create_app
+    assert store.health_check(str(tmp_path)) == "ok"
+    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+        r = client.get("/healthz")
+        assert r.status_code == 200 and r.json()["storage"] == "ok"
+    print("PASS test_healthz_reports_store")
+
+
+def test_register_rejects_malformed_json(tmp_path):
+    # A malformed body must be a clean 400, not a 500 from the unguarded req.json().
+    from fastapi.testclient import TestClient
+    from roger_server.app import create_app
+    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+        r = client.post("/round/register", content=b"{not json",
+                        headers={"Content-Type": "application/json"})
+        assert r.status_code == 400
+    print("PASS test_register_rejects_malformed_json")
+
+
 def test_absent_global(tmp_path):
     assert store.open_global_reader(str(tmp_path), "nope") is None   # never-folded model ⇒ None, not a crash
     assert store.open_global_stream(str(tmp_path), "nope") is None

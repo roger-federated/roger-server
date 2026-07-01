@@ -9,6 +9,7 @@ description = "Roger Federated — aggregation server for federated LoRA gradien
 requires-python = ">=3.10"
 dependencies = [
     "torch",          # CPU-only is enough: the server does NO inference, just int64 sums + safetensors I/O
+    "numpy",          # tensor->bytes via .numpy() in the global-write path (modern torch no longer pulls it in)
     "safetensors",    # the on-the-wire ΔW blob format (delta.py / store.py)
     "cryptography",   # X25519 EC-DH pairwise secrets for secure aggregation (secure_agg.py)
     "fastapi",

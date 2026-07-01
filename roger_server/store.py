@@ -9,7 +9,7 @@ Uploads are STAGED here one temp object each (`stage_*`) and folded one module a
 S3 has no in-place partial write, so the global is rebuilt streamed. Both paths (cohort + the single-
 upload bootstrap `dp_fold`) stream this way. boto3 imported lazily.
 """
-import hashlib, json, os, re, shutil, struct
+import hashlib, json, os, re, shutil, struct, uuid
 
 import torch
 
@@ -227,6 +227,56 @@ def stage_cleanup(datadir: str, round_id: str) -> None:
             client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": o["Key"]} for o in objs]})
     else:
         shutil.rmtree(os.path.join(datadir, "tmp", round_id), ignore_errors=True)
+
+
+def _purge_global(datadir: str, model_id: str) -> None:
+    """Delete a model's stored global (both the blob + version objects). Only used to clean up the
+    health check's throwaway probe model."""
+    if _backend() == "s3":
+        client, bucket, prefix = _s3_conf()
+        stem = prefix + _stem(model_id)
+        client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": stem + ".safetensors"},
+                                                                 {"Key": stem + ".version"}]})
+    else:
+        for p in _fs_paths(datadir, model_id):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def health_check(datadir: str) -> str:
+    """Exercise BOTH durable-write paths against a throwaway probe model so a broken/misconfigured store
+    fails LOUDLY at /healthz with the real reason, instead of hiding behind the fail-soft reads (which
+    return "empty" on any error -> a write-broken server looks like a healthy 204). Covers (1) upload
+    staging (tmp/ multipart + range read) and (2) the GLOBAL write dp_fold/finalize actually publish
+    (root-key multipart object + .version put_object) -- these differ in key prefix and op, so a
+    prefix-scoped policy can pass (1) yet fail (2). "ok" or a short error string; never creds."""
+    probe_mid, rid, slot, probe = "__roger_healthz__", "healthz-" + uuid.uuid4().hex, "u", b"roger-healthz"
+    gw = None
+    try:
+        w = stage_writer(datadir, rid, slot)          # (1) staging round-trip
+        w.write(probe)
+        w.commit()
+        if _stage_read(datadir, rid, slot, 0, len(probe)) != probe:
+            return "stage readback mismatch"
+        gw = global_writer(datadir, probe_mid, [("probe", "F32", (2, 2))])   # (2) global publish
+        gw.write(torch.zeros(2, 2, dtype=torch.float32).numpy().tobytes())
+        gw.commit(1)
+        gw = None                                      # committed; nothing to abort
+        r = open_global_reader(datadir, probe_mid)
+        if r is None or "probe" not in r.keys:
+            return "global readback missing"
+        return "ok"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    finally:
+        cleanups = [lambda: stage_cleanup(datadir, rid), lambda: _purge_global(datadir, probe_mid)]
+        if gw is not None:                             # errored before commit -> abort the open MPU
+            cleanups.insert(0, gw.abort)
+        for cleanup in cleanups:
+            try:
+                cleanup()
+            except Exception:
+                pass
 
 
 # --- per-module global read (old G) + streamed write (new G) ---------------------------------
