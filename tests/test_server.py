@@ -36,28 +36,31 @@ def _mask_cohort(payloads):
     return uploads, pubs
 
 
-def _pack(masked, compat, spec_json, round_id, model_id="m"):
+def _pack(masked, compat, spec_json, round_id, model_id="m", token=""):
     return st_save({"masked": masked}, metadata={"model_id": model_id, "compat": compat,
-                                                  "spec": spec_json, "round_id": round_id})
+                                                  "spec": spec_json, "round_id": round_id,
+                                                  "token": token})
 
 
 def _seal_with(agg, pubs, ip="1.2.3.4", model="m"):
-    rnd = None
+    """Returns (round, tokens): tokens[i] is the secret /contribute must present for pubs[i]."""
+    rnd, tokens = None, []
     for pub in pubs:
-        rnd = agg.add_registrant(model, pub.hex(), ip, now=0.0)
+        rnd, token = agg.add_registrant(model, pub.hex(), ip, now=0.0)
+        tokens.append(token)
     agg.try_seal(rnd)
-    return rnd
+    return rnd, tokens
 
 
-def _stage(agg, rnd, masked, compat, spec_json, ip="1.2.3.4", model="m"):
+def _stage(agg, rnd, masked, compat, spec_json, token, model="m"):
     """Validate + stage one upload exactly as the wire layer does; returns the begin_stage status."""
-    r, slot, res = agg.begin_stage(rnd.round_id, compat, spec_json, ip,
+    r, slot, res = agg.begin_stage(rnd.round_id, compat, spec_json, token,
                                    masked_i64=(masked.dtype == torch.int64 and masked.dim() == 1),
                                    masked_len=masked.numel())
     if res != "ok":
         return res
     w = store.stage_writer(agg.datadir, rnd.round_id, slot)
-    w.write(_pack(masked, compat, spec_json, rnd.round_id, model))
+    w.write(_pack(masked, compat, spec_json, rnd.round_id, model, token))
     w.commit()
     agg.mark_received(r, slot)
     return res
@@ -85,10 +88,10 @@ def test_aggregator_recovers_mean(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(N)]
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=N)
-    rnd = _seal_with(agg, pubs)
+    rnd, tokens = _seal_with(agg, pubs)
     assert rnd.sealed and set(rnd.sealed_peers) == {p.hex() for p in pubs}
-    for masked, compat, spec_json in uploads:
-        assert _stage(agg, rnd, masked, compat, spec_json) == "ok"
+    for token, (masked, compat, spec_json) in zip(tokens, uploads):
+        assert _stage(agg, rnd, masked, compat, spec_json, token) == "ok"
     _finalize(agg, rnd)
     blob, version = _pull(agg)
     tensors, _ = delta.from_bytes(blob)
@@ -106,9 +109,9 @@ def test_two_rounds_accumulate(tmp_path):
     for _ in range(2):
         payloads = [{KEY: torch.randn(6, 4) * 0.02} for _ in range(2)]
         uploads, pubs = _mask_cohort(payloads)
-        rnd = _seal_with(agg, pubs)
-        for masked, compat, spec_json in uploads:
-            _stage(agg, rnd, masked, compat, spec_json)
+        rnd, tokens = _seal_with(agg, pubs)
+        for token, (masked, compat, spec_json) in zip(tokens, uploads):
+            _stage(agg, rnd, masked, compat, spec_json, token)
         _finalize(agg, rnd)
         totals += sum(p[KEY] for p in payloads) / 2          # cumulative Σ mean(ΔW)
     blob, version = _pull(agg)
@@ -121,9 +124,9 @@ def test_dropout_voids_round(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(3)]
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=3)
-    rnd = _seal_with(agg, pubs)
-    for masked, compat, spec_json in uploads[:-1]:          # one sealed member never uploads
-        _stage(agg, rnd, masked, compat, spec_json)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, compat, spec_json) in zip(tokens, uploads[:-1]):  # one sealed member never uploads
+        _stage(agg, rnd, masked, compat, spec_json, token)
     _finalize(agg, rnd)
     assert _pull(agg) is None                               # global untouched (masks wouldn't cancel)
     assert not (tmp_path / "tmp" / rnd.round_id).exists()   # voided round's staged objects cleaned up
@@ -133,7 +136,7 @@ def test_dropout_voids_round(tmp_path):
 def test_subquorum_register_fails(tmp_path):
     # Only 1 registrant at the deadline with k_min=2 ⇒ the round FAILS rather than leaking a lone ΔW.
     agg = Aggregator(str(tmp_path), k_min=2, k_target=8)
-    rnd = agg.add_registrant("m", "aa", "1.2.3.4", now=0.0)
+    rnd, _token = agg.add_registrant("m", "aa", "1.2.3.4", now=0.0)
     agg.try_seal(rnd, final=True)
     assert rnd.failed and not rnd.sealed
     print("PASS test_subquorum_register_fails")
@@ -145,9 +148,9 @@ def test_norm_bound_voids_aggregate(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 3.0} for _ in range(N)]   # ΣΔW ≫ k·clip ⇒ over the honest bound
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=N, clip_norm=1.0, eta=1.0)
-    rnd = _seal_with(agg, pubs)
-    for masked, compat, spec_json in uploads:
-        _stage(agg, rnd, masked, compat, spec_json)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, compat, spec_json) in zip(tokens, uploads):
+        _stage(agg, rnd, masked, compat, spec_json, token)
     _finalize(agg, rnd)
     assert _pull(agg) is None                 # only a non-clipping client exceeds k·clip ⇒ round voided
     print("PASS test_norm_bound_voids_aggregate")
@@ -157,12 +160,15 @@ def test_rejects_bad_uploads(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    rnd = _seal_with(agg, pubs)
+    rnd, tokens = _seal_with(agg, pubs)
     masked, compat, spec_json = uploads[0]
-    assert _stage(agg, rnd, masked.float(), compat, spec_json) == "bad tensor"          # wrong dtype
-    assert _stage(agg, rnd, masked, "deadbeef", spec_json) == "ok"                       # first fixes compat
-    assert _stage(agg, rnd, uploads[1][0], "different", spec_json) == "compat mismatch"
-    assert _stage(agg, rnd, masked, compat, spec_json, ip="9.9.9.9") == "ip not in cohort"  # IP-binding
+    assert _stage(agg, rnd, masked.float(), compat, spec_json, tokens[0]) == "bad tensor"  # wrong dtype
+    assert _stage(agg, rnd, masked, "deadbeef", spec_json, tokens[0]) == "ok"           # first fixes compat
+    assert _stage(agg, rnd, uploads[1][0], "different", spec_json, tokens[1]) == "compat mismatch"
+    assert _stage(agg, rnd, masked, compat, spec_json, "not-a-real-token") == "invalid token"
+    # tokens[0] already completed an upload above: reusing it is exactly the same-registrant
+    # double-upload this token scheme is meant to block (it would otherwise corrupt mask cancellation).
+    assert _stage(agg, rnd, masked, compat, spec_json, tokens[0]) == "token already used"
     print("PASS test_rejects_bad_uploads")
 
 
@@ -170,9 +176,9 @@ def test_serve_global_cursor(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    rnd = _seal_with(agg, pubs)
-    for masked, compat, spec_json in uploads:
-        _stage(agg, rnd, masked, compat, spec_json)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, compat, spec_json) in zip(tokens, uploads):
+        _stage(agg, rnd, masked, compat, spec_json, token)
     _finalize(agg, rnd)
     assert agg.serve_global("m", "1") is None            # since == current version ⇒ nothing new
     assert agg.serve_global("m", "") is not None
@@ -190,16 +196,16 @@ def test_concurrent_cohorts_per_model(tmp_path):
     up_a, pubs_a = _mask_cohort(payloads_a)
     up_b, pubs_b = _mask_cohort(payloads_b)
 
-    rnd_a = _seal_with(agg, pubs_a)                          # cohort A seals, now COLLECTING
-    rnd_b = _seal_with(agg, pubs_b)                          # B forms + seals while A still collects
+    rnd_a, tokens_a = _seal_with(agg, pubs_a)                # cohort A seals, now COLLECTING
+    rnd_b, tokens_b = _seal_with(agg, pubs_b)                # B forms + seals while A still collects
     assert rnd_a.round_id != rnd_b.round_id
     assert rnd_a.round_id in agg.collecting and rnd_b.round_id in agg.collecting  # both live at once
 
     # Interleave uploads; each routes by its round_id (and stages to its own temp prefix).
-    _stage(agg, rnd_b, up_b[0][0], up_b[0][1], up_b[0][2])
-    _stage(agg, rnd_a, up_a[0][0], up_a[0][1], up_a[0][2])
-    _stage(agg, rnd_b, up_b[1][0], up_b[1][1], up_b[1][2])
-    _stage(agg, rnd_a, up_a[1][0], up_a[1][1], up_a[1][2])
+    _stage(agg, rnd_b, up_b[0][0], up_b[0][1], up_b[0][2], tokens_b[0])
+    _stage(agg, rnd_a, up_a[0][0], up_a[0][1], up_a[0][2], tokens_a[0])
+    _stage(agg, rnd_b, up_b[1][0], up_b[1][1], up_b[1][2], tokens_b[1])
+    _stage(agg, rnd_a, up_a[1][0], up_a[1][1], up_a[1][2], tokens_a[1])
     _finalize(agg, rnd_a)
     _finalize(agg, rnd_b)
 
@@ -213,9 +219,9 @@ def test_global_persists_across_restart(tmp_path):
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
     uploads, pubs = _mask_cohort(payloads)
     agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    rnd = _seal_with(agg, pubs)
-    for masked, compat, spec_json in uploads:
-        _stage(agg, rnd, masked, compat, spec_json)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, compat, spec_json) in zip(tokens, uploads):
+        _stage(agg, rnd, masked, compat, spec_json, token)
     _finalize(agg, rnd)
     reloaded = Aggregator(str(tmp_path))                  # fresh instance serves from storage, no eager load
     blob, version = _pull(reloaded)
@@ -250,9 +256,9 @@ def test_s3_backend_round_trip(tmp_path, monkeypatch):
         payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
         uploads, pubs = _mask_cohort(payloads)
         agg = Aggregator(str(tmp_path), k_min=2, k_target=2)   # datadir is unused by the s3 backend
-        rnd = _seal_with(agg, pubs)
-        for masked, compat, spec_json in uploads:
-            _stage(agg, rnd, masked, compat, spec_json)
+        rnd, tokens = _seal_with(agg, pubs)
+        for token, (masked, compat, spec_json) in zip(tokens, uploads):
+            _stage(agg, rnd, masked, compat, spec_json, token)
         _finalize(agg, rnd)
 
         reloaded = Aggregator(str(tmp_path))               # cold start: rehydrate from object storage only
@@ -396,8 +402,7 @@ def test_http_end_to_end(tmp_path, monkeypatch):
     N = 3
     payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(N)]
     uploads, pubs = _mask_cohort(payloads)
-    # ip_binding off: every TestClient request shares the "testclient" host, but be explicit.
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=N, ip_binding=False)
+    agg = Aggregator(str(tmp_path), k_min=2, k_target=N)
 
     with TestClient(create_app(agg)) as client:
         # Concurrent registration: the cohort seals once all N are in-flight, returning the same peers.
@@ -409,9 +414,11 @@ def test_http_end_to_end(tmp_path, monkeypatch):
         assert set(regs[0].json()["peers"]) == {p.hex() for p in pubs}
         round_id = regs[0].json()["round_id"]                 # all members of one cohort share it
         assert all(r.json()["round_id"] == round_id for r in regs)
+        tokens = [r.json()["token"] for r in regs]            # ex.map preserves pubs' order in regs
 
-        for masked, compat, spec_json in uploads:
-            r = client.post("/contribute", content=_pack(masked, compat, spec_json, round_id),
+        for token, (masked, compat, spec_json) in zip(tokens, uploads):
+            r = client.post("/contribute",
+                            content=_pack(masked, compat, spec_json, round_id, token=token),
                             headers={"Content-Type": "application/octet-stream"})
             assert r.status_code == 200
 
@@ -430,7 +437,7 @@ def test_http_bootstrap_path(tmp_path):
     from roger_server.app import create_app
 
     torch.manual_seed(6)
-    agg = Aggregator(str(tmp_path), busy_threshold=3, ip_binding=False, clip_norm=10.0)
+    agg = Aggregator(str(tmp_path), busy_threshold=3, clip_norm=10.0)
     with TestClient(create_app(agg)) as client:
         # A fresh model is sparse ⇒ /status says bootstrap; the client uploads an unmasked dense ΔW.
         assert client.get("/status", params={"model_id": "m"}).json()["mode"] == "bootstrap"

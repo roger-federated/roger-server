@@ -83,13 +83,15 @@ on scale-to-zero is harmless — idle means "bootstrap" is the correct mode anyw
 staged to `tmp/` survive a scale-to-zero, but their round's cohort barrier does not, so the round voids
 and the `tmp/` lifecycle rule reclaims them.)
 
-## IP-binding behind a managed platform
-A managed platform terminates TLS in front of the container, so the real client IP arrives via
-`X-Forwarded-For`. The server only trusts that header from proxies listed in `ROGER_AGG_TRUSTED_PROXIES`
-— but these platforms rarely publish a *stable* proxy CIDR to whitelist. IP-binding is best-effort
-anyway, so set **`ROGER_AGG_IPBIND=0`** rather than trusting `0.0.0.0/0` (which would let any client
-spoof its IP — strictly worse than turning the check off). On a VM where you control the proxy (next
-section), the default trusted set covers localhost and IP-binding can stay on.
+## Client IP behind a managed platform
+Cohort membership is proven by a per-registration secret token (issued at seal, required back at
+`/contribute`), not by client IP — so IP no longer needs to be trustworthy for security. It's only
+used to estimate "how many distinct contributors recently," which drives the bootstrap→busy mode
+switch. A managed platform terminates TLS in front of the container, so the real client IP arrives
+via `X-Forwarded-For`; the server only trusts that header from proxies listed in
+`ROGER_AGG_TRUSTED_PROXIES` (these platforms rarely publish a *stable* proxy CIDR to whitelist, but
+getting this wrong now just skews when a model flips to busy mode, not who can upload). On a VM
+where you control the proxy (next section), the default trusted set covers localhost.
 
 ## Memory sizing
 Memory used to be the load-bearing constraint; two changes removed it.
@@ -125,7 +127,6 @@ ROGER_S3_REGION=nl-ams
 ROGER_S3_BUCKET=roger-agg
 ROGER_S3_KEY=<access key>                        # store as a secret
 ROGER_S3_SECRET=<secret key>                     # store as a secret
-ROGER_AGG_IPBIND=0                               # managed platform: no stable proxy CIDR
 ```
 
 **Storage**
@@ -149,9 +150,8 @@ ROGER_AGG_IPBIND=0                               # managed platform: no stable p
 | `ROGER_AGG_CLIP` | `1.0` | Per-client L2 budget. The server **voids** a round whose aggregate `‖ΣΔW‖` exceeds `cohort_size · CLIP` (a bootstrap upload exceeding `CLIP`). Honest clients clip below this, so only a non-clipping client trips it. |
 | `ROGER_AGG_BUSY_THRESHOLD` | *(=`KTARGET`)* | Distinct recent contributors needed to switch a model from bootstrap (async DP) to busy (secure-agg cohorts). |
 | `ROGER_AGG_BUSY_WINDOW` | `180` | Rolling window, seconds, over which those distinct contributors are counted. |
-| `ROGER_AGG_IPBIND` | `1` | Reject an upload whose source IP never registered (best-effort only). Set `0` on managed platforms without a stable proxy CIDR. |
 | `ROGER_AGG_MODELS` | *(any)* | Comma-separated `model_id` allowlist; empty accepts any base model. Scope which models a deployment serves (e.g. to bound per-round S3 I/O for very large models; see memory sizing). |
-| `ROGER_AGG_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,10.0.0.0/8` | Proxies whose `X-Forwarded-For` is trusted for the real client IP. On managed platforms prefer `ROGER_AGG_IPBIND=0` over widening this. |
+| `ROGER_AGG_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,10.0.0.0/8` | Proxies whose `X-Forwarded-For` is trusted for the real client IP (only used for the busy-mode contributor count; cohort membership is proven by the `/round/register` token, not IP). |
 | `ROGER_MIN_CLIENT` | `0` | Minimum client protocol version (`CLIENT_VERSION`) this deployment accepts. Clients below it self-skip contributing and tell the user to update; `0` = no floor. Raise it after a breaking protocol change so stale clients stop poisoning the global. |
 | `ROGER_LATEST_CLIENT` | `0` | Newest client version to advertise. A client below it (but at/above `ROGER_MIN_CLIENT`) prints an advisory "update available" notice without being blocked; `0` = no notice. |
 
@@ -166,9 +166,11 @@ ROGER_AGG_IPBIND=0                               # managed platform: no stable p
   ~`W`-second window; a sub-`KMIN` cohort gets a 503 and retries (safe behaviour — it would otherwise
   expose an individual ΔW).
 - No dropout recovery yet: one sealed member that never uploads voids only its own cohort.
-- Federations are open and unauthenticated; IP-binding is weak. Secure aggregation hides individual
-  ΔW but can't filter a *well-formed* poisoned upload — only the aggregate norm bound (over-norm rounds
-  are voided), small cohorts, and small `ETA` bound the damage. Strong per-client bounds need ZK range
+- Federations are open; `/contribute` requires the secret token issued to that registrant at
+  `/round/register`, proving the uploader sealed into this cohort (not IP matching, which is
+  spoofable/NAT-shared). Secure aggregation hides individual ΔW but can't filter a *well-formed*
+  poisoned upload from a genuine cohort member — only the aggregate norm bound (over-norm rounds are
+  voided), small cohorts, and small `ETA` bound the damage. Strong per-client bounds need ZK range
   proofs (future work).
 - **State durability:** only the cumulative global is durable (one blob + version per model). A round's
   in-flight uploads are staged under `tmp/<round_id>/` and deleted at finalize; open cohorts and the

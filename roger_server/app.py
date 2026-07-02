@@ -5,9 +5,11 @@ Endpoints the client's transport.py speaks:
                          see aggregate.mode(); min_client/latest_client advertise the client protocol
                          version this deployment requires/prefers — ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT,
                          both default 0 = no opinion — so an out-of-date client self-skips + nudges an update)
-  POST /round/register   {model_id, pubkey(hex)} -> {round_id, peers:[hex,...]}   (long-polls until the
-                         cohort seals; 503 if it stays below k_min so the client skips — an empty peer
-                         set would make the client upload UNMASKED, leaking its ΔW).
+  POST /round/register   {model_id, pubkey(hex)} -> {round_id, token, peers:[hex,...]}   (long-polls
+                         until the cohort seals; 503 if it stays below k_min so the client skips — an
+                         empty peer set would make the client upload UNMASKED, leaking its ΔW. `token`
+                         is this registrant's secret; /contribute requires it back, proving the uploader
+                         is the same party that received this cohort's peer set).
   POST /contribute       octet-stream safetensors ({"masked": int64} + meta) -> 200. The body is
                          STREAMED straight to a per-upload temp object in the store; never buffered whole.
   POST /contribute_dp    octet-stream safetensors (dense ΔW + meta) -> 200   (bootstrap: a single
@@ -48,7 +50,6 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         eta=float(os.environ.get("ROGER_AGG_ETA", "1.0")),
         eta_boot=float(os.environ["ROGER_AGG_ETA_BOOT"]) if os.environ.get("ROGER_AGG_ETA_BOOT") else None,
         clip_norm=float(os.environ.get("ROGER_AGG_CLIP", "1.0")),
-        ip_binding=os.environ.get("ROGER_AGG_IPBIND", "1") != "0",
         allowlist=_env_set("ROGER_AGG_MODELS"),
         busy_threshold=int(os.environ["ROGER_AGG_BUSY_THRESHOLD"]) if os.environ.get("ROGER_AGG_BUSY_THRESHOLD") else None,
         busy_window=float(os.environ.get("ROGER_AGG_BUSY_WINDOW", "180")),
@@ -156,7 +157,7 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
             raise HTTPException(403, "model_id not accepted by this federation")
         ip = client_ip(req)
         async with cond:
-            rnd = agg.add_registrant(model_id, pubkey, ip, time.monotonic())
+            rnd, token = agg.add_registrant(model_id, pubkey, ip, time.monotonic())
             agg.try_seal(rnd)                  # this arrival may itself complete the cohort
             cond.notify_all()
             while not (rnd.sealed or rnd.failed):
@@ -176,7 +177,8 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
                     rnd.finalize_scheduled = True
                     asyncio.create_task(_finalize_after(rnd))
         if rnd.sealed:
-            return {"round_id": round_id, "peers": peers}  # client echoes round_id on /contribute
+            # client echoes round_id + token on /contribute
+            return {"round_id": round_id, "token": token, "peers": peers}
         raise HTTPException(503, "cohort below privacy minimum; skipping this round")
 
     @app.post("/contribute")
@@ -191,10 +193,10 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         masked_len = 1
         for d in m.get("shape", []):
             masked_len *= d
-        round_id = meta.get("round_id", "")
+        round_id, token = meta.get("round_id", ""), meta.get("token", "")
         async with cond:
             rnd, slot, res = agg.begin_stage(round_id, meta.get("compat", ""), meta.get("spec", "[]"),
-                                             client_ip(req),
+                                             token,
                                              masked_i64=(m.get("dtype") == "I64" and len(m.get("shape", [])) == 1),
                                              masked_len=masked_len)
         if res != "ok":
@@ -205,7 +207,7 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         except Exception:
             await run_in_threadpool(writer.abort)
             async with cond:
-                agg.unreserve(rnd)
+                agg.unreserve(rnd, token)
             raise HTTPException(400, "upload failed")
         async with cond:
             agg.mark_received(rnd, slot)

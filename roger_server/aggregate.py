@@ -6,9 +6,10 @@ touching only a round already pulled from `collecting` + storage, so it can't ra
 
 Lifecycle (per model_id, one registering round at a time; on seal it gets a round_id and moves aside,
 so cohorts collect concurrently, self-routed by round_id):
-  REGISTERING  /round/register collects X25519 pubkeys + IPs.
+  REGISTERING  /round/register collects X25519 pubkeys, issuing each registrant a secret upload token.
   -> sealed    at K_target, or at the W deadline if >= K_min (else FAILED: sub-K_min leaks a lone ΔW).
-  COLLECTING   /contribute streams each masked upload to its OWN temp object (never a RAM running-sum).
+  COLLECTING   /contribute streams each masked upload to its OWN temp object (never a RAM running-sum),
+               gated on the registrant's token so only cohort members upload, each at most once.
   -> finalized all uploaded, or U deadline: sum staged slices per module (masks cancel), fold into the
                global, voiding if ‖ΣΔW‖ exceeds k·clip. Masks cancel only if EVERY member uploaded.
 
@@ -17,7 +18,7 @@ resident for the whole window × concurrent cohorts overruns serverless tiers; p
 matrix. Bootstrap (sparse `mode()`): one unmasked DP ΔW to /contribute_dp, `dp_fold` (k=1) — the same
 per-module streamed fold, just no cohort.
 """
-import json, uuid
+import json, secrets, uuid
 
 import torch
 
@@ -31,7 +32,11 @@ class Round:
     def __init__(self, model_id: str, created: float):
         self.model_id = model_id
         self.created = created                  # time.monotonic() at first registration (W deadline)
-        self.registrants: dict[str, str] = {}   # pubkey hex -> source IP (insertion order = arrival)
+        # pubkey hex -> secret upload token (insertion order = arrival). The token is this registrant's
+        # proof that it's the same party /contribute must accept for that slot (not the source IP, which
+        # is spoofable/NAT-shared).
+        self.registrants: dict[str, str] = {}
+        self.spent_tokens: set = set()          # tokens already claimed (reserved or completed) at /contribute
         self.sealed = False
         self.failed = False                     # cohort too small, or a mismatched contribution
         self.finalized = False
@@ -46,8 +51,11 @@ class Round:
         self.inflight = 0                       # reservations whose upload is still streaming
         self.received = 0
 
-    def registrant_ips(self) -> set:
-        return set(self.registrants.values())
+    def token_pubkey(self, token: str) -> str | None:
+        for pubkey, tok in self.registrants.items():
+            if tok == token:
+                return pubkey
+        return None
 
 
 def _parse_spec(spec_json: str) -> tuple:
@@ -65,7 +73,7 @@ def _parse_spec(spec_json: str) -> tuple:
 
 class Aggregator:
     def __init__(self, datadir: str, *, k_min: int = 3, k_target: int = 5, eta: float = 1.0,
-                 eta_boot: float | None = None, clip_norm: float = 1.0, ip_binding: bool = True,
+                 eta_boot: float | None = None, clip_norm: float = 1.0,
                  allowlist: set | None = None, busy_threshold: int | None = None,
                  busy_window: float = 180.0):
         self.datadir = datadir
@@ -74,7 +82,6 @@ class Aggregator:
         self.eta = eta                          # server learning rate: G <- G + η·mean(ΔW)
         self.eta_boot = eta if eta_boot is None else eta_boot  # rate for a single async DP upload
         self.clip_norm = clip_norm              # aggregate L2 cap (honest cohort sums to ≤ k·clip_norm)
-        self.ip_binding = ip_binding
         self.allowlist = allowlist              # None = accept any model_id
         self.busy_threshold = k_target if busy_threshold is None else busy_threshold
         self.busy_window = busy_window
@@ -105,15 +112,18 @@ class Aggregator:
 
     # --- registration / sealing -------------------------------------------------------------
 
-    def add_registrant(self, model_id: str, pubkey: str, ip: str, now: float) -> Round:
-        """Join this model_id's open registering round, opening a fresh one if none is registering."""
+    def add_registrant(self, model_id: str, pubkey: str, ip: str, now: float) -> tuple[Round, str]:
+        """Join this model_id's open registering round, opening a fresh one if none is registering.
+        Returns (round, token): a fresh secret this registrant must present at /contribute to prove
+        it's the one that received this cohort's peer set (not just anyone sharing its IP)."""
         self._note_contributor(model_id, ip, now)
         rnd = self.registering.get(model_id)
         if rnd is None:
             rnd = Round(model_id, created=now)
             self.registering[model_id] = rnd
-        rnd.registrants[pubkey] = ip
-        return rnd
+        token = secrets.token_urlsafe(32)
+        rnd.registrants[pubkey] = token
+        return rnd, token
 
     def try_seal(self, rnd: Round, *, final: bool = False) -> None:
         """Seal at k_target (immediate) or, at the W deadline (`final`), at k_min. A `final` round below
@@ -133,22 +143,25 @@ class Aggregator:
 
     # --- contribution staging (lock-held bookkeeping; the I/O is in app.py) ------------------
 
-    def begin_stage(self, round_id: str, compat: str, spec_json: str, ip: str, *,
+    def begin_stage(self, round_id: str, compat: str, spec_json: str, token: str, *,
                     masked_i64: bool = True, masked_len: int | None = None) -> tuple:
         """Validate an incoming upload and reserve a slot. Returns (round, slot_id, "ok") or
         (None, None, error). The caller streams the body to `store.stage_writer(.., round_id, slot)`,
-        then calls mark_received (success) or unreserve (failure). Reserving under the lock caps the
-        cohort at k even with concurrent uploads. masked_i64/masked_len come from the upload's
-        safetensors header (we never decode the whole tensor here)."""
+        then calls mark_received (success) or unreserve (failure). `token` must be the secret this
+        round's /round/register handed to a specific registrant, proving the uploader is that same
+        party (not just anyone sharing its IP) and letting each registrant upload at most once —
+        the cohort is capped at k by construction (there are only k valid tokens), with no separate
+        count check needed. masked_i64/masked_len come from the upload's safetensors header (we never
+        decode the whole tensor here)."""
         rnd = self.collecting.get(round_id)
         if rnd is None or rnd.finalized:
             return None, None, "no active round"
-        if self.ip_binding and ip not in rnd.registrant_ips():
-            return None, None, "ip not in cohort"   # weak (NAT/open registration) but free
+        if rnd.token_pubkey(token) is None:
+            return None, None, "invalid token"
+        if token in rnd.spent_tokens:
+            return None, None, "token already used"
         if not masked_i64:
             return None, None, "bad tensor"          # masked must be a 1-D int64 residue vector
-        if len(rnd.staged) + rnd.inflight >= len(rnd.sealed_peers):
-            return None, None, "round full"          # can't dedup peers w/o signatures; cap the count
         spec, length = _parse_spec(spec_json)
         if masked_len is not None and masked_len != length:
             return None, None, "length mismatch"
@@ -157,6 +170,7 @@ class Aggregator:
         elif compat != rnd.compat or length != rnd.length:
             rnd.failed = True                         # mixed layouts can't cancel coordinate-wise -> void
             return None, None, "compat mismatch"
+        rnd.spent_tokens.add(token)                   # reserve now; freed by unreserve() on stream failure
         rnd.inflight += 1
         return rnd, uuid.uuid4().hex, "ok"
 
@@ -165,8 +179,9 @@ class Aggregator:
         rnd.staged.add(slot)
         rnd.received = len(rnd.staged)
 
-    def unreserve(self, rnd: Round) -> None:
+    def unreserve(self, rnd: Round, token: str) -> None:
         rnd.inflight -= 1
+        rnd.spent_tokens.discard(token)
 
     def complete(self, rnd: Round) -> bool:
         return rnd.received == len(rnd.sealed_peers)

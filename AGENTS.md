@@ -51,8 +51,10 @@ If you change the quantization, the flatten order, the safetensors metadata keys
 - **Cold-start = DP-noised async bootstrap.** While a model has < `busy_threshold` recent contributors,
   `/status` serves `bootstrap`: clients skip the cohort and upload ONE faux-DP-noised unmasked dense ΔW
   to `/contribute_dp` (k=1 fold). Once busy, secure-agg only; quorum k_min=3 / k_target=5.
-- NOT yet built: Shamir/double-mask dropout recovery, central ground-truth anti-poison gate, membership
-  auth (round-token/signature). See the readme TODO in the client repo.
+- NOT yet built: Shamir/double-mask dropout recovery, central ground-truth anti-poison gate. See the
+  readme TODO in the client repo. (Membership auth is built: a secret token issued at
+  `/round/register` and required back at `/contribute` — see `Round.token_pubkey`/`spent_tokens` in
+  `aggregate.py`.)
 
 ## Dev environment
 - Python: conda env **`roger`** (Python 3.13, CUDA torch) — `~/.conda/envs/roger/python.exe`. Bare
@@ -65,5 +67,6 @@ If you change the quantization, the flatten order, the safetensors metadata keys
 - Minimum necessary changes; no speculative abstraction. Dense *why*-not-*what* comments; no docstrings
   that merely restate the signature. Avoid em-dashes in code/comments/text; prefer ; , ().
 - Deploy/setup docs stay generic + provider-agnostic (an expert, or a novice with a chatbot, on any
-  S3-compatible provider), not a one-provider walkthrough; keep portable caveats like `ROGER_AGG_IPBIND`.
+  S3-compatible provider), not a one-provider walkthrough; keep portable caveats like
+  `ROGER_AGG_TRUSTED_PROXIES`.
 - When something here is wrong/stale and a future session would benefit, update this file as part of the work.
