@@ -1,8 +1,10 @@
 """app.py — FastAPI wire layer for the aggregation server.
 
 Endpoints the client's transport.py speaks:
-  GET  /status?model_id=  -> {mode, k_min, k_target, min_client, latest_client}   (which regime to use,
-                         see aggregate.mode(); min_client/latest_client advertise the client protocol
+  GET  /status?model_id=  -> {mode, models, k_min, k_target, min_client, latest_client}   (which regime to
+                         use, see aggregate.mode(); `models` = the ROGER_AGG_MODELS allowlist, null when any
+                         model is accepted, so a client can tell its user which models to run;
+                         min_client/latest_client advertise the client protocol
                          version this deployment requires/prefers — ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT,
                          both default 0 = no opinion — so an out-of-date client self-skips + nudges an update)
   POST /round/register   {model_id, pubkey(hex)} -> {round_id, token, peers:[hex,...]}   (long-polls
@@ -98,7 +100,11 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         async with cond:
             return {"mode": agg.mode(model_id, time.monotonic()),
                     "k_min": agg.k_min, "k_target": agg.k_target,
-                    "min_client": min_client, "latest_client": latest_client}
+                    "min_client": min_client, "latest_client": latest_client,
+                    # The allowlist itself (null = any model): a bare "unsupported" isn't actionable for
+                    # the runtime wrapper, which only knows the runtime's own name for its model (a gguf
+                    # path, an alias) and needs the accepted HF ids to match against and to show the user.
+                    "models": sorted(agg.allowlist) if agg.allowlist is not None else None}
 
     @app.get("/healthz")
     async def healthz():

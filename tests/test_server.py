@@ -337,10 +337,13 @@ def test_allowlist_reports_unsupported(tmp_path):
     assert agg.mode("ok", now=0.0) == "bootstrap"
     assert agg.mode("nope", now=0.0) == "unsupported"
     with TestClient(create_app(agg)) as client:
-        assert client.get("/status", params={"model_id": "nope"}).json()["mode"] == "unsupported"
+        body = client.get("/status", params={"model_id": "nope"}).json()
+        assert body["mode"] == "unsupported" and body["models"] == ["ok"]   # the list is what's actionable
         assert client.get("/status", params={"model_id": "ok"}).json()["mode"] == "bootstrap"
-    # No allowlist ⇒ every model is supported (never "unsupported").
+    # No allowlist ⇒ every model is supported (never "unsupported"), advertised as models: null.
     assert Aggregator(str(tmp_path), allowlist=None).mode("anything", now=0.0) == "bootstrap"
+    with TestClient(create_app(Aggregator(str(tmp_path), allowlist=None))) as client:
+        assert client.get("/status", params={"model_id": "anything"}).json()["models"] is None
     print("PASS test_allowlist_reports_unsupported")
 
 
