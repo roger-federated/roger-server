@@ -1,22 +1,31 @@
 """app.py — FastAPI wire layer for the aggregation server.
 
 Endpoints the client's transport.py speaks:
-  GET  /status?model_id=  -> {mode, models, k_min, k_target, min_client, latest_client}   (which regime to
-                         use, see aggregate.mode(); `models` = the ROGER_AGG_MODELS allowlist, null when any
-                         model is accepted, so a client can tell its user which models to run;
-                         min_client/latest_client advertise the client protocol
+  GET  /status?model_id=  -> {mode, models, k_min, k_target, min_client, latest_client, rank, epoch, phase}
+                         (which regime to use, see aggregate.mode(); `models` = the ROGER_AGG_MODELS
+                         allowlist, null when any model is accepted, so a client can tell its user which
+                         models to run; min_client/latest_client advertise the client protocol
                          version this deployment requires/prefers — ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT,
-                         both default 0 = no opinion — so an out-of-date client self-skips + nudges an update)
-  POST /round/register   {model_id, pubkey(hex)} -> {round_id, token, peers:[hex,...]}   (long-polls
-                         until the cohort seals; 503 if it stays below k_min so the client skips — an
-                         empty peer set would make the client upload UNMASKED, leaking its ΔW. `token`
-                         is this registrant's secret; /contribute requires it back, proving the uploader
-                         is the same party that received this cohort's peer set).
+                         both default 0 = no opinion — so an out-of-date client self-skips + nudges an
+                         update; `rank`/`epoch`/`phase` are the factor state the client must train
+                         against THIS round: train only `phase`'s factor ("B" or "A", see delta.py) and
+                         stamp `epoch` on the upload. `rank` is the federation's rank CAP, from which the
+                         client derives the per-module map with delta.rank_for(out, in, cap). A client
+                         re-reads this right before it trains, since work from a past epoch is rejected.)
+  POST /round/register   {model_id, pubkey(hex)} -> {round_id, token, peers:[hex,...], epoch, phase, rank}
+                         (long-polls until the cohort seals; 503 if it stays below k_min so the client
+                         skips — an empty peer set would make the client upload UNMASKED, leaking its Δ.
+                         `token` is this registrant's secret; /contribute requires it back, proving the
+                         uploader is the same party that received this cohort's peer set. The factor
+                         state is echoed as of the SEAL, so a client whose training predates an epoch
+                         flip can drop its upload here instead of sending a blob that will be voided.)
   POST /contribute       octet-stream safetensors ({"masked": int64} + meta) -> 200. The body is
                          STREAMED straight to a per-upload temp object in the store; never buffered whole.
-  POST /contribute_dp    octet-stream safetensors (dense ΔW + meta) -> 200   (bootstrap: a single
-                         DP-noised UNMASKED ΔW, folded in RAM into the global — no cohort)
-  GET  /global?since=&model_id=  -> 204, or 200 streamed octet-stream dense ΔW + X-Cursor header.
+                         meta carries round_id/token plus the upload stamp: compat, spec (the flattened
+                         factor keys + shapes), base ({module: [out, in]}) and epoch.
+  POST /contribute_dp    octet-stream safetensors (one factor's Δ + the same stamp) -> 200   (bootstrap:
+                         a single DP-noised UNMASKED Δ, streamed + folded per module — no cohort)
+  GET  /global?since=&model_id=  -> 204, or 200 streamed octet-stream LoRA factors + X-Cursor header.
 
 Concurrency. /round/register holds the connection on an asyncio.Condition until its round seals — the
 barrier that gives every cohort member the *same* frozen peer set (so the pairwise masks cancel). All
@@ -55,6 +64,8 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         allowlist=_env_set("ROGER_AGG_MODELS"),
         busy_threshold=int(os.environ["ROGER_AGG_BUSY_THRESHOLD"]) if os.environ.get("ROGER_AGG_BUSY_THRESHOLD") else None,
         busy_window=float(os.environ.get("ROGER_AGG_BUSY_WINDOW", "180")),
+        rank=int(os.environ.get("ROGER_AGG_RANK", "16")),
+        epoch_folds=int(os.environ.get("ROGER_AGG_EPOCH_FOLDS", "20")),
     )
     register_window = float(os.environ.get("ROGER_AGG_W", "20"))   # < client 30s register timeout
     collect_window = float(os.environ.get("ROGER_AGG_U", "20"))    # how long to wait for all uploads
@@ -97,10 +108,15 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status(model_id: str = ""):
+        st = await run_in_threadpool(agg.state, model_id)   # off-thread: a cache miss reads the store
         async with cond:
             return {"mode": agg.mode(model_id, time.monotonic()),
                     "k_min": agg.k_min, "k_target": agg.k_target,
                     "min_client": min_client, "latest_client": latest_client,
+                    # Which factor to train, under which rank cap, in which epoch (see delta.py; the
+                    # per-module ranks come from delta.rank_for). The client reads this immediately
+                    # before a training round and stamps the epoch on its upload.
+                    "rank": st["rank"], "epoch": st["epoch"], "phase": st["phase"],
                     # The allowlist itself (null = any model): a bare "unsupported" isn't actionable for
                     # the runtime wrapper, which only knows the runtime's own name for its model (a gguf
                     # path, an alias) and needs the accepted HF ids to match against and to show the user.
@@ -122,7 +138,8 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         hdr, prefix = await _read_header(stream)
         if hdr is None:
             raise HTTPException(400, "malformed contribution blob")
-        model_id = hdr.get("__metadata__", {}).get("model_id", "")
+        meta = hdr.get("__metadata__", {})
+        model_id = meta.get("model_id", "")
         if not model_id:
             raise HTTPException(400, "model_id required")
         async with cond:
@@ -131,6 +148,13 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
                 lock = finalize_locks.setdefault(model_id, asyncio.Lock())
         if pre != "ok":
             raise HTTPException(400, pre)
+        # Check the stamp (epoch / factor / rank / base) against the model's state BEFORE spending an
+        # upload's worth of bandwidth + staging on a blob that could never be folded.
+        epoch = _epoch(meta)
+        base, res = await run_in_threadpool(agg.check_upload, model_id, meta.get("compat", ""),
+                                            meta.get("base", ""), epoch, _header_spec(hdr))
+        if res != "ok":
+            raise HTTPException(400, res)
         round_id, slot = "dp-" + uuid.uuid4().hex, "u"
         writer = await run_in_threadpool(store.stage_writer, agg.datadir, round_id, slot)
         try:
@@ -141,7 +165,7 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
             raise HTTPException(400, "upload failed")
         try:
             async with lock:                   # serialize G writes with same-model cohort finalizes
-                res = await run_in_threadpool(agg.dp_fold, model_id, round_id, slot)
+                res = await run_in_threadpool(agg.dp_fold, model_id, base, epoch, round_id, slot)
         finally:
             await run_in_threadpool(store.stage_cleanup, agg.datadir, round_id)
         async with cond:
@@ -162,6 +186,7 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         if agg.allowlist is not None and model_id not in agg.allowlist:
             raise HTTPException(403, "model_id not accepted by this federation")
         ip = client_ip(req)
+        await run_in_threadpool(agg.state, model_id)   # warm the factor state off the event loop
         async with cond:
             rnd, token = agg.add_registrant(model_id, pubkey, ip, time.monotonic())
             agg.try_seal(rnd)                  # this arrival may itself complete the cohort
@@ -183,8 +208,11 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
                     rnd.finalize_scheduled = True
                     asyncio.create_task(_finalize_after(rnd))
         if rnd.sealed:
-            # client echoes round_id + token on /contribute
-            return {"round_id": round_id, "token": token, "peers": peers}
+            # client echoes round_id + token on /contribute. The factor state rides along so a client
+            # whose training predates an epoch flip can drop its upload here, before sending it.
+            st = agg.state(model_id)           # warm above, so this is a dict read, not store I/O
+            return {"round_id": round_id, "token": token, "peers": peers,
+                    "epoch": st["epoch"], "phase": st["phase"], "rank": st["rank"]}
         raise HTTPException(503, "cohort below privacy minimum; skipping this round")
 
     @app.post("/contribute")
@@ -200,9 +228,12 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
         for d in m.get("shape", []):
             masked_len *= d
         round_id, token = meta.get("round_id", ""), meta.get("token", "")
+        model_id = agg.round_model(round_id)                  # lock-free dict lookup
+        if model_id is not None:
+            await run_in_threadpool(agg.state, model_id)      # warm the factor state off the event loop
         async with cond:
             rnd, slot, res = agg.begin_stage(round_id, meta.get("compat", ""), meta.get("spec", "[]"),
-                                             token,
+                                             meta.get("base", ""), _epoch(meta), token,
                                              masked_i64=(m.get("dtype") == "I64" and len(m.get("shape", [])) == 1),
                                              masked_len=masked_len)
         if res != "ok":
@@ -232,6 +263,19 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
                                  headers={"X-Cursor": str(version)})
 
     return app
+
+
+def _epoch(meta: dict) -> int:
+    """The epoch an upload says it was trained in; -1 (never current) when absent or malformed."""
+    try:
+        return int(meta["epoch"])
+    except Exception:
+        return -1
+
+
+def _header_spec(hdr: dict) -> list:
+    """[(key, shape)] of the tensors in a safetensors header, for the bootstrap path's stamp check."""
+    return [(key, tuple(v.get("shape", ()))) for key, v in hdr.items() if key != "__metadata__"]
 
 
 async def _read_header(stream):

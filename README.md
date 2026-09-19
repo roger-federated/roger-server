@@ -2,25 +2,51 @@
 
 The aggregation server for [Roger Federated](https://github.com/roger-federated/roger-federated). It is
 what makes a *federation*: it seals secure-aggregation cohorts, sums the masked client uploads
-(individual gradients stay hidden), and serves the cumulative global ΔW that members fold into their
-base model. Anyone can run one; a federation is just its URL.
+(individual gradients stay hidden), and serves the cumulative **global LoRA adapter** that members
+attach to the model their runtime serves. Anyone can run one; a federation is just its URL.
+
+## How a federation trains (read this first)
+Everything on the wire is **LoRA factors**, never a dense weight delta: the global *is* the adapter
+(`<module>.lora_A.weight` [r, in] and `.lora_B.weight` [out, r]), so a member can attach it to
+llama.cpp or vllm directly.
+
+That forces one rule on the protocol. Secure aggregation only ever hands the server the *sum* of a
+cohort's uploads, and factors do not sum: `(ΣB)(ΣA) = Σ BᵢAᵢ + Σ_{i≠j} BᵢAⱼ`, and those cross terms are
+pure error. So a federation trains **one factor at a time**:
+
+- In a **B-epoch**, `A` is frozen and identical for every member. Clients train `B` only and upload
+  `ΔB`, and `Σ(ΔBᵢ)·A = Σ(ΔBᵢ·A)` is exact. An **A-epoch** mirrors it. Epoch 0 trains `B`, since LoRA
+  starts at `B = 0` and `A`'s gradient would be zero.
+- The epoch advances after `ROGER_AGG_EPOCH_FOLDS` successful folds. `GET /status` advertises
+  `{rank, epoch, phase}`, and a client reads it **immediately before training** so it trains the right
+  factor; every upload is stamped with its epoch, and an upload from a past epoch is **voided** (it was
+  trained against a factor the federation has since moved).
+- **Rank is per module but static.** `ROGER_AGG_RANK` is a *cap*; each module's actual rank is
+  `min(max(min(out, in) / 128, 8), cap, min(out, in))`, so a 4096² `q_proj` gets the cap while a
+  GQA-shrunk `v_proj` gets the floor and costs half the upload. The map is a pure function of the base
+  shapes and the cap, so every member derives the same one before training, it never moves for a given
+  model, and uploads whose factor shapes disagree are rejected.
+- The initial frozen `A` is **derived, not transmitted** (seeded from the model id + module + shape via
+  SHAKE-256), so a client with no global to pull yet still trains against the exact `A` the server will
+  fold its `ΔB` into.
+
+A side effect is that uploads are now factor-sized (`r·(out + in)` per module) rather than the full
+dense basis, which is roughly two orders of magnitude less per-round traffic.
 
 The server is **intrinsically single-instance**: secure aggregation only works when every cohort member
 reaches the *same* process (one in-memory masked sum, one barrier), and concurrency is handled by
 spawning rounds *inside* that one process — never by adding processes. So you want exactly **0 or 1**
 instance, never more. That makes it a perfect fit for a **scale-to-zero container**: it runs the one
 process while there's traffic and costs ~nothing while idle. The only durable state — the cumulative
-global ΔW — lives in **S3-compatible object storage**, so it survives the container scaling to zero.
+global LoRA adapter — lives in **S3-compatible object storage**, so it survives the container scaling to zero.
 
 Any managed scale-to-zero container platform works (Scaleway Serverless Containers, Koyeb, ...). The
 instructions below are deliberately platform-agnostic; map them onto your provider's console or CLI.
 
-> **Read the [memory sizing](#memory-sizing) section.** The server now stages every upload to object
-> storage and aggregates **one module at a time**, so peak RAM is ~a single weight matrix at *any* model
-> size — memory is no longer the binding constraint. For large base models the constraint shifts to the
-> **per-round S3 I/O** (each round moves the cohort's uploads through the bucket), so size `ROGER_AGG_U`
-> and your bucket bandwidth accordingly. Also add the **`tmp/` lifecycle rule** (below) so a crashed
-> round can't leave staged objects behind.
+> **Read the [memory sizing](#memory-sizing) section.** The server stages every upload to object storage
+> and aggregates **one module at a time**, so peak RAM is ~a single factor at *any* model size, and
+> factor-only uploads keep per-round I/O small as well. Add the **`tmp/` lifecycle rule** (below) so a
+> crashed round can't leave staged objects behind.
 
 ## Quick start
 ```bash
@@ -31,9 +57,9 @@ python -m roger_server         # serve (uvicorn on 0.0.0.0:8000)
 
 ## Relationship to the client
 The gradient-sharing client lives in the separate `roger-federated` repo. This server never imports the
-client; they interoperate purely over HTTP. The secure-aggregation + ΔW wire format is mirrored by hand
-in `roger_server/secure_agg.py` and `roger_server/delta.py`; see `AGENTS.md` for what must stay in
-lockstep across the two repos.
+client; they interoperate purely over HTTP. The secure-aggregation + LoRA-factor wire format is mirrored
+by hand in `roger_server/secure_agg.py` and `roger_server/delta.py`; see `AGENTS.md` for what must stay
+in lockstep across the two repos.
 
 ## What you need
 - An **S3-compatible object-storage bucket** plus an access key + secret. The container holds these
@@ -62,7 +88,8 @@ lockstep across the two repos.
 3. **Deploy the container** from the image with the [settings](#container-settings) and
    [environment](#environment-variables) below.
 4. **Smoke-test:** `curl -i "https://<your-url>/global?model_id=x"` should return **204** before any
-   upload. Members then add the URL to `~/.roger/config.json`: `"federations": ["https://<your-url>"]`.
+   upload, and `curl "https://<your-url>/status?model_id=x"` should report the `rank`/`epoch`/`phase`
+   clients will train against. Members then add the URL to `~/.roger/config.json`: `"federations": ["https://<your-url>"]`.
 
 ## Container settings
 | Setting | Value | Why |
@@ -94,29 +121,31 @@ getting this wrong now just skews when a model flips to busy mode, not who can u
 where you control the proxy (next section), the default trusted set covers localhost.
 
 ## Memory sizing
-Memory used to be the load-bearing constraint; two changes removed it.
+Memory used to be the load-bearing constraint; three changes removed it.
 
 - **Narrow basis.** The client trains the federated LoRA on `q_proj`/`v_proj` only (`lora_utils.FED_TARGETS`),
-  the fixed dense basis every member shares. That is ~a few percent of an `all-linear` target set, so the
-  cumulative dense global and each masked upload are correspondingly small.
-- **Stage + aggregate per module.** A secure-agg round must sum every member's masked vector over the full
-  dense basis; summed in RAM that is `8·P_target` bytes (int64) resident for the whole collection window,
-  × concurrent cohorts — which is what blew past serverless tiers. Instead the server **streams each upload
-  to its own object** under `tmp/<round_id>/` and, at finalize, reads back **one module at a time**
-  (range-GET), sums it (masks cancel per coordinate), folds it into the global, and streams the new global
-  out via multipart. Peak RAM is ~one weight matrix plus small buffers, at **any** model size, and
-  concurrent cohorts no longer multiply it (their partial state lives in the bucket, not RAM). The server
-  also no longer pre-loads every model's global; it touches only the model in the request.
+  the fixed basis every member shares. That is ~a few percent of an `all-linear` target set.
+- **Factors, not dense deltas.** An upload is one LoRA factor's update, `r·out` or `r·in` numbers per
+  module instead of `out·in`, with `r` per module (see the rank rule above). At cap 16 on the q/v basis
+  of a 7B model that is tens of MB per member per round, against several GB when dense deltas were on
+  the wire.
+- **Stage + aggregate per module.** A secure-agg round must sum every member's masked vector over the
+  epoch's whole factor basis; summed in RAM, × concurrent cohorts, that is what blew past serverless
+  tiers. Instead the server **streams each upload to its own object** under `tmp/<round_id>/` and, at
+  finalize, reads back **one factor at a time** (range-GET), sums it (masks cancel per coordinate),
+  folds it into the global, and streams the new global out via multipart. Peak RAM is ~one factor plus
+  small buffers, at **any** model size, and concurrent cohorts no longer multiply it (their partial
+  state lives in the bucket, not RAM). The server also no longer pre-loads every model's global; it
+  touches only the model in the request.
 
 Consequences:
 - A **small memory tier suffices** (2–4 GB is ample). **Ephemeral/scratch storage is irrelevant** — on
   Scaleway Serverless Containers it is RAM-backed tmpfs (writing N bytes to `/tmp` raises memory use by N
   and counts against the limit), so it was never a real spill target; we stage to the S3 bucket instead.
-- The remaining constraint for **large** models is **per-round S3 I/O**, not RAM: each round moves the
-  cohort's uploads (`~k × P_target` int64) into the bucket and reads them back to aggregate. With the q/v
-  basis this is modest for small/mid models; for the very largest, give `ROGER_AGG_U` more headroom and
-  expect more S3 request volume. `ROGER_AGG_MODELS` still lets you allowlist which base models a given
-  deployment serves.
+- **Per-round S3 I/O** is what scales with model size now, and factor-sized uploads keep it modest even
+  for large bases. The one full-size object per fold is the **global itself**, rebuilt streamed each
+  time (`r·(out + in)` per module, so also factor-sized). `ROGER_AGG_MODELS` still lets you allowlist
+  which base models a given deployment serves.
 
 ## Environment variables
 A filled-in `s3` example (real Scaleway region/bucket; supply your own key/secret as platform secrets):
@@ -141,13 +170,15 @@ ROGER_S3_SECRET=<secret key>                     # store as a secret
 **Aggregation knobs**
 | Var | Default | Meaning |
 |---|---|---|
-| `ROGER_AGG_KMIN` | `3` | Min cohort size to seal (a cohort of 1 is unmasked; at 2 each peer can subtract its own ΔW to recover the other's). Also the collusion margin: unmasking one member needs `KMIN−1` colluding peers. |
+| `ROGER_AGG_KMIN` | `3` | Min cohort size to seal (a cohort of 1 is unmasked; at 2 each peer can subtract its own Δ to recover the other's). Also the collusion margin: unmasking one member needs `KMIN−1` colluding peers. |
 | `ROGER_AGG_KTARGET` | `5` | Seal immediately at this many registrants. Also the dropout blast radius (a no-show voids its whole cohort), so keep it modest. Defaults to the busy-mode threshold below. |
 | `ROGER_AGG_W` | `20` | Registration window, seconds — must stay below the client's 30 s timeout *and* below the platform's request timeout. |
 | `ROGER_AGG_U` | `20` | Seconds to wait for every sealed member to upload before voiding the round. |
-| `ROGER_AGG_ETA` | `1.0` | Server learning rate: `G ← G + η·mean(ΔW)`. Lower to damp noisy rounds. |
-| `ROGER_AGG_ETA_BOOT` | *(=`ETA`)* | Learning rate for a single async bootstrap upload (`G ← G + η_boot·ΔW`, k=1). Lower it to damp the noisier per-upload bootstrap gradients. |
-| `ROGER_AGG_CLIP` | `1.0` | Per-client L2 budget. The server **voids** a round whose aggregate `‖ΣΔW‖` exceeds `cohort_size · CLIP` (a bootstrap upload exceeding `CLIP`). Honest clients clip below this, so only a non-clipping client trips it. |
+| `ROGER_AGG_ETA` | `1.0` | Server learning rate: `G ← G + η·mean(Δ)` on the epoch's trainable factor. Lower to damp noisy rounds. |
+| `ROGER_AGG_ETA_BOOT` | *(=`ETA`)* | Learning rate for a single async bootstrap upload (`G ← G + η_boot·Δ`, k=1). Lower it to damp the noisier per-upload bootstrap gradients. |
+| `ROGER_AGG_CLIP` | `1.0` | Per-client L2 budget, in **factor space** (the norm of the uploaded `ΔB`/`ΔA`). The server **voids** a round whose aggregate `‖ΣΔ‖` exceeds `cohort_size · CLIP` (a bootstrap upload exceeding `CLIP`). Honest clients clip below this, so only a non-clipping client trips it. |
+| `ROGER_AGG_RANK` | `16` | The federation's rank **cap**, advertised at `/status`. Per-module rank is `min(max(min(out, in) / 128, 8), cap, min(out, in))`; raise the cap to give wide modules more capacity (and bigger uploads), lower it to bound every module. It applies to globals created from here on; a model whose global already exists keeps the cap it was created with. |
+| `ROGER_AGG_EPOCH_FOLDS` | `20` | Successful folds before the epoch advances and the trained factor swaps (`B` ⇄ `A`). Short epochs spread training over both factors sooner; long ones waste less work at boundaries, since an upload trained in a past epoch is voided. |
 | `ROGER_AGG_BUSY_THRESHOLD` | *(=`KTARGET`)* | Distinct recent contributors needed to switch a model from bootstrap (async DP) to busy (secure-agg cohorts). |
 | `ROGER_AGG_BUSY_WINDOW` | `180` | Rolling window, seconds, over which those distinct contributors are counted. |
 | `ROGER_AGG_MODELS` | *(any)* | Comma-separated `model_id` allowlist; empty accepts any base model. Scope which models a deployment serves (e.g. to bound per-round S3 I/O for very large models; see memory sizing). Advertised verbatim as `models` at `/status` (`null` when empty) so clients can tell users which models to run. |
@@ -157,18 +188,22 @@ ROGER_S3_SECRET=<secret key>                     # store as a secret
 
 ## Notes & limits
 - **Cold-start is handled by bootstrap mode.** While a model has fewer than `BUSY_THRESHOLD` recent
-  contributors, `/status` reports `bootstrap` and clients upload a single DP-noised, *unmasked* ΔW to
-  `/contribute_dp`, folded asynchronously — no cohort, no arrival coincidence, no 503. Privacy then
+  contributors, `/status` reports `bootstrap` and clients upload a single DP-noised, *unmasked* factor Δ
+  to `/contribute_dp`, folded asynchronously — no cohort, no arrival coincidence, no 503. Privacy then
   rests on the client's (faux-)DP factor noise, not secure aggregation, so bootstrap is a temporary
   obfuscation regime: expect noisy, modest per-upload gradients until the federation fills up. Once
   `BUSY_THRESHOLD` distinct contributors appear within `BUSY_WINDOW`, the model flips to busy mode.
 - In **busy** mode a round only aggregates when ≥`KMIN` members register and upload within the same
   ~`W`-second window; a sub-`KMIN` cohort gets a 503 and retries (safe behaviour — it would otherwise
-  expose an individual ΔW).
+  expose an individual Δ).
 - No dropout recovery yet: one sealed member that never uploads voids only its own cohort.
+- **Work can go stale at an epoch boundary.** A client trains against the frozen factor of the epoch it
+  read at `/status`; if the epoch advances before its upload folds, the upload is voided (at
+  `/round/register` or `/contribute`, or at finalize for a cohort that straddles the boundary). Raise
+  `ROGER_AGG_EPOCH_FOLDS` if you see that often.
 - Federations are open; `/contribute` requires the secret token issued to that registrant at
   `/round/register`, proving the uploader sealed into this cohort (not IP matching, which is
-  spoofable/NAT-shared). Secure aggregation hides individual ΔW but can't filter a *well-formed*
+  spoofable/NAT-shared). Secure aggregation hides individual Δ but can't filter a *well-formed*
   poisoned upload from a genuine cohort member — only the aggregate norm bound (over-norm rounds are
   voided), small cohorts, and small `ETA` bound the damage. Strong per-client bounds need ZK range
   proofs (future work).

@@ -5,11 +5,13 @@ event loop); the HTTP test exercises the FastAPI wire layer + the register/seal 
 TestClient calls. Synthetic clients reuse the real client crypto (secure_agg.quantize/mask), so the
 mask-cancellation the server relies on is genuinely tested end-to-end.
 
-The cohort path stages each masked upload to its own object in `store` and aggregates one module at a
-time at finalize (so server RAM is ~one module, not the whole model). `_stage` mirrors the wire path:
-validate+reserve via begin_stage, write the blob through store.stage_writer, mark_received.
+Every upload carries ONE LoRA factor's update (delta.py): a B-epoch cohort uploads ΔB against the
+frozen A, an A-epoch cohort the reverse. The cohort path stages each masked upload to its own object in
+`store` and aggregates one factor at a time at finalize (so server RAM is ~one factor, not the whole
+model). `_stage` mirrors the wire path: validate+reserve via begin_stage, write the blob through
+store.stage_writer, mark_received.
 """
-import json, os
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -21,10 +23,28 @@ from roger_server import store
 from roger_server.aggregate import Aggregator
 
 KEY = "base_model.model.model.layers.0.self_attn.q_proj"
+OUT, IN, RANK = 6, 4, 2                       # a tiny module + the rank these tests' federations run at
+BASE = {KEY: (OUT, IN)}                       # {module: (out, in)} — what `base`/`compat` describe
+B_KEY, A_KEY = KEY + delta.LORA_B, KEY + delta.LORA_A
+COMPAT = delta.compat_from_shapes(BASE)
+BASE_JSON = delta.base_to_json(BASE)
 
 
-def _mask_cohort(payloads):
-    """Mirror the client: quantize each dense ΔW, pairwise-mask against the whole cohort's pubkeys.
+def _agg(tmp_path, **kw) -> Aggregator:
+    kw.setdefault("rank", RANK)
+    return Aggregator(str(tmp_path), **kw)
+
+
+def _dB(scale=0.05):
+    return {B_KEY: torch.randn(OUT, RANK) * scale}
+
+
+def _dA(scale=0.05):
+    return {A_KEY: torch.randn(RANK, IN) * scale}
+
+
+def _mask_cohort(payloads, compat=COMPAT):
+    """Mirror the client: quantize each factor Δ, pairwise-mask against the whole cohort's pubkeys.
     Returns (uploads, pubs) where uploads = [(masked int64, compat, spec_json)]."""
     pairs = [secure_agg.gen_keypair() for _ in payloads]
     pubs = [pub for _, pub in pairs]
@@ -32,13 +52,14 @@ def _mask_cohort(payloads):
     for (priv, _), p in zip(pairs, payloads):
         q, spec = secure_agg.quantize(p)
         masked = secure_agg.mask(q, priv, pubs)
-        uploads.append((masked, delta.compat_hash(p), json.dumps([[k, list(s)] for k, s in spec])))
+        uploads.append((masked, compat, json.dumps([[k, list(s)] for k, s in spec])))
     return uploads, pubs
 
 
-def _pack(masked, compat, spec_json, round_id, model_id="m", token=""):
+def _pack(masked, compat, spec_json, round_id, model_id="m", token="", epoch=0, base_json=BASE_JSON):
     return st_save({"masked": masked}, metadata={"model_id": model_id, "compat": compat,
-                                                  "spec": spec_json, "round_id": round_id,
+                                                  "spec": spec_json, "base": base_json,
+                                                  "epoch": str(epoch), "round_id": round_id,
                                                   "token": token})
 
 
@@ -52,18 +73,28 @@ def _seal_with(agg, pubs, ip="1.2.3.4", model="m"):
     return rnd, tokens
 
 
-def _stage(agg, rnd, masked, compat, spec_json, token, model="m"):
+def _stage(agg, rnd, masked, compat, spec_json, token, model="m", epoch=0, base_json=BASE_JSON):
     """Validate + stage one upload exactly as the wire layer does; returns the begin_stage status."""
-    r, slot, res = agg.begin_stage(rnd.round_id, compat, spec_json, token,
+    r, slot, res = agg.begin_stage(rnd.round_id, compat, spec_json, base_json, epoch, token,
                                    masked_i64=(masked.dtype == torch.int64 and masked.dim() == 1),
                                    masked_len=masked.numel())
     if res != "ok":
         return res
     w = store.stage_writer(agg.datadir, rnd.round_id, slot)
-    w.write(_pack(masked, compat, spec_json, rnd.round_id, model, token))
+    w.write(_pack(masked, compat, spec_json, rnd.round_id, model, token, epoch, base_json))
     w.commit()
     agg.mark_received(r, slot)
     return res
+
+
+def _round(agg, payloads, epoch=0):
+    """One whole cohort: seal, stage every member's masked factor Δ, finalize."""
+    uploads, pubs = _mask_cohort(payloads)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, compat, spec_json) in zip(tokens, uploads):
+        _stage(agg, rnd, masked, compat, spec_json, token, epoch=epoch)
+    _finalize(agg, rnd)
+    return rnd
 
 
 def _finalize(agg, rnd):
@@ -80,50 +111,119 @@ def _pull(agg, model="m", since=""):
     return b"".join(chunks), version
 
 
+def _global(agg, model="m"):
+    """(tensors, metadata) of the stored global, or None when nothing has been folded yet."""
+    res = _pull(agg, model)
+    return None if res is None else delta.from_bytes(res[0])
+
+
+def _dp(model_id="m", factors=None, epoch=0, base=BASE):
+    return delta.to_bytes(factors, model_id, {"base": delta.base_to_json(base), "epoch": str(epoch)})
+
+
 # --- core: recovery + FedAvg accumulation ----------------------------------------------------
 
 def test_aggregator_recovers_mean(tmp_path):
     torch.manual_seed(0)
     N = 4
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(N)]
+    payloads = [_dB() for _ in range(N)]
     uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=N)
+    agg = _agg(tmp_path, k_min=2, k_target=N)
     rnd, tokens = _seal_with(agg, pubs)
     assert rnd.sealed and set(rnd.sealed_peers) == {p.hex() for p in pubs}
     for token, (masked, compat, spec_json) in zip(tokens, uploads):
         assert _stage(agg, rnd, masked, compat, spec_json, token) == "ok"
     _finalize(agg, rnd)
-    blob, version = _pull(agg)
-    tensors, _ = delta.from_bytes(blob)
-    expected = sum(p[KEY] for p in payloads) / N            # η=1, no clip ⇒ plain mean of ΔW
-    assert torch.allclose(tensors[KEY], expected, atol=1e-2)
-    assert version == 1
+    tensors, meta = _global(agg)
+    expected = sum(p[B_KEY] for p in payloads) / N          # η=1, no clip ⇒ plain mean of ΔB
+    assert torch.allclose(tensors[B_KEY], expected, atol=1e-4)
+    # A was never uploaded: the global carries the derived frozen A the cohort trained against.
+    assert torch.equal(tensors[A_KEY], delta.init_A("m", KEY, RANK, IN))
+    assert meta["scaling"] == "1" and meta["rank"] == str(RANK) and meta["phase"] == "B"
+    assert _pull(agg)[1] == 1
     assert not (tmp_path / "tmp").exists() or not list((tmp_path / "tmp").iterdir())   # temp cleaned
     print("PASS test_aggregator_recovers_mean")
 
 
 def test_two_rounds_accumulate(tmp_path):
     torch.manual_seed(1)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    totals = torch.zeros(6, 4)
+    agg = _agg(tmp_path, k_min=2, k_target=2)
+    totals = torch.zeros(OUT, RANK)
     for _ in range(2):
-        payloads = [{KEY: torch.randn(6, 4) * 0.02} for _ in range(2)]
-        uploads, pubs = _mask_cohort(payloads)
-        rnd, tokens = _seal_with(agg, pubs)
-        for token, (masked, compat, spec_json) in zip(tokens, uploads):
-            _stage(agg, rnd, masked, compat, spec_json, token)
-        _finalize(agg, rnd)
-        totals += sum(p[KEY] for p in payloads) / 2          # cumulative Σ mean(ΔW)
+        payloads = [_dB(0.02) for _ in range(2)]
+        _round(agg, payloads)
+        totals += sum(p[B_KEY] for p in payloads) / 2        # cumulative Σ mean(ΔB)
     blob, version = _pull(agg)
     tensors, _ = delta.from_bytes(blob)
-    assert version == 2 and torch.allclose(tensors[KEY], totals, atol=1e-2)
+    assert version == 2 and torch.allclose(tensors[B_KEY], totals, atol=1e-4)
     print("PASS test_two_rounds_accumulate")
 
 
+def test_epoch_swaps_the_trained_factor(tmp_path):
+    # After `epoch_folds` folds the federation flips to training A: the same-shaped ΔA folds into the
+    # frozen-A baseline while B is carried over untouched, and a straggler still stamped with the old
+    # epoch is refused (its ΔB was trained against an A that has since moved).
+    torch.manual_seed(7)
+    agg = _agg(tmp_path, k_min=2, k_target=2, epoch_folds=1)
+    dB = [_dB() for _ in range(2)]
+    _round(agg, dB)
+    assert agg.state("m")["epoch"] == 1 and agg.state("m")["phase"] == "A"
+
+    stale, pubs = _mask_cohort([_dB()] * 2)
+    rnd, tokens = _seal_with(agg, pubs)
+    assert _stage(agg, rnd, stale[0][0], COMPAT, stale[0][2], tokens[0], epoch=0) == "stale epoch"
+    wrong_factor, _ = _mask_cohort([_dB()])
+    assert _stage(agg, rnd, wrong_factor[0][0], COMPAT, wrong_factor[0][2], tokens[0],
+                  epoch=1).startswith("expected A-factor")
+
+    dA = [_dA() for _ in range(2)]
+    _round(agg, dA, epoch=1)
+    tensors, meta = _global(agg)
+    assert torch.allclose(tensors[A_KEY],
+                          delta.init_A("m", KEY, RANK, IN) + sum(p[A_KEY] for p in dA) / 2, atol=1e-4)
+    assert torch.allclose(tensors[B_KEY], sum(p[B_KEY] for p in dB) / 2, atol=1e-4)   # B carried over
+    assert meta["epoch"] == "2" and meta["phase"] == "B"    # back to training B against the new A
+    print("PASS test_epoch_swaps_the_trained_factor")
+
+
+def test_per_module_rank_map(tmp_path):
+    # Rank is per module: a narrow matrix earns less of it than a wide one, and the map is a pure
+    # function of (shape, cap), so every member derives the same one before training.
+    assert delta.rank_for(4096, 4096, 16) == 16 and delta.rank_for(1024, 4096, 16) == 8   # q vs GQA v
+    assert delta.rank_for(4096, 4096, 64) == 32                                           # cap not binding
+    assert delta.rank_for(2, 2, 16) == 2                                                  # never exceed the matrix
+
+    torch.manual_seed(9)
+    narrow = KEY.replace("q_proj", "v_proj")
+    base = {KEY: (OUT, 4), narrow: (OUT, 2)}                  # ⇒ ranks 4 and 2 under cap 8
+    compat, base_json = delta.compat_from_shapes(base), delta.base_to_json(base)
+    agg = _agg(tmp_path, k_min=2, k_target=2, rank=8)
+    payloads = [{KEY + delta.LORA_B: torch.randn(OUT, 4) * 0.02,
+                 narrow + delta.LORA_B: torch.randn(OUT, 2) * 0.02} for _ in range(2)]
+    uploads, pubs = _mask_cohort(payloads, compat)
+    rnd, tokens = _seal_with(agg, pubs)
+    for token, (masked, _c, spec_json) in zip(tokens, uploads):
+        assert _stage(agg, rnd, masked, compat, spec_json, token, base_json=base_json) == "ok"
+    _finalize(agg, rnd)
+    tensors, _ = _global(agg)
+    assert tensors[KEY + delta.LORA_A].shape == (4, 4)
+    assert tensors[narrow + delta.LORA_A].shape == (2, 2)
+    assert torch.allclose(tensors[narrow + delta.LORA_B],
+                          sum(p[narrow + delta.LORA_B] for p in payloads) / 2, atol=1e-4)
+
+    # Uploading the wide module's rank for the narrow one is refused, naming the module's own rank.
+    wide = [{narrow + delta.LORA_B: torch.randn(OUT, 4)} for _ in range(2)]
+    up, pubs2 = _mask_cohort(wide, compat)
+    rnd2, tok2 = _seal_with(agg, pubs2)
+    assert _stage(agg, rnd2, up[0][0], compat, up[0][2], tok2[0],
+                  base_json=base_json) == f"rank mismatch ({narrow} trains at rank 2 here)"
+    print("PASS test_per_module_rank_map")
+
+
 def test_dropout_voids_round(tmp_path):
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(3)]
+    payloads = [_dB() for _ in range(3)]
     uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=3)
+    agg = _agg(tmp_path, k_min=2, k_target=3)
     rnd, tokens = _seal_with(agg, pubs)
     for token, (masked, compat, spec_json) in zip(tokens, uploads[:-1]):  # one sealed member never uploads
         _stage(agg, rnd, masked, compat, spec_json, token)
@@ -134,8 +234,8 @@ def test_dropout_voids_round(tmp_path):
 
 
 def test_subquorum_register_fails(tmp_path):
-    # Only 1 registrant at the deadline with k_min=2 ⇒ the round FAILS rather than leaking a lone ΔW.
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=8)
+    # Only 1 registrant at the deadline with k_min=2 ⇒ the round FAILS rather than leaking a lone Δ.
+    agg = _agg(tmp_path, k_min=2, k_target=8)
     rnd, _token = agg.add_registrant("m", "aa", "1.2.3.4", now=0.0)
     agg.try_seal(rnd, final=True)
     assert rnd.failed and not rnd.sealed
@@ -145,41 +245,42 @@ def test_subquorum_register_fails(tmp_path):
 def test_norm_bound_voids_aggregate(tmp_path):
     torch.manual_seed(2)
     N = 3
-    payloads = [{KEY: torch.randn(6, 4) * 3.0} for _ in range(N)]   # ΣΔW ≫ k·clip ⇒ over the honest bound
-    uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=N, clip_norm=1.0, eta=1.0)
-    rnd, tokens = _seal_with(agg, pubs)
-    for token, (masked, compat, spec_json) in zip(tokens, uploads):
-        _stage(agg, rnd, masked, compat, spec_json, token)
-    _finalize(agg, rnd)
+    payloads = [_dB(3.0) for _ in range(N)]      # ΣΔB ≫ k·clip ⇒ over the honest bound
+    agg = _agg(tmp_path, k_min=2, k_target=N, clip_norm=1.0, eta=1.0)
+    _round(agg, payloads)
     assert _pull(agg) is None                 # only a non-clipping client exceeds k·clip ⇒ round voided
     print("PASS test_norm_bound_voids_aggregate")
 
 
 def test_rejects_bad_uploads(tmp_path):
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
+    payloads = [_dB() for _ in range(2)]
     uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
+    agg = _agg(tmp_path, k_min=2, k_target=2)
     rnd, tokens = _seal_with(agg, pubs)
     masked, compat, spec_json = uploads[0]
     assert _stage(agg, rnd, masked.float(), compat, spec_json, tokens[0]) == "bad tensor"  # wrong dtype
-    assert _stage(agg, rnd, masked, "deadbeef", spec_json, tokens[0]) == "ok"           # first fixes compat
-    assert _stage(agg, rnd, uploads[1][0], "different", spec_json, tokens[1]) == "compat mismatch"
+    # `compat` must be exactly the digest of the `base` shape map travelling with it, so a client can't
+    # hand the server a digest that hides what it is really uploading.
+    assert _stage(agg, rnd, masked, "deadbeef", spec_json, tokens[0]) == "bad base shapes"
+    # A factor at the wrong rank can't be added to this federation's global at all.
+    wide, _ = _mask_cohort([{B_KEY: torch.randn(OUT, RANK + 1)}])
+    assert _stage(agg, rnd, wide[0][0], compat, wide[0][2], tokens[0]).startswith("rank mismatch")
     assert _stage(agg, rnd, masked, compat, spec_json, "not-a-real-token") == "invalid token"
+    assert _stage(agg, rnd, masked, compat, spec_json, tokens[0]) == "ok"
     # tokens[0] already completed an upload above: reusing it is exactly the same-registrant
     # double-upload this token scheme is meant to block (it would otherwise corrupt mask cancellation).
     assert _stage(agg, rnd, masked, compat, spec_json, tokens[0]) == "token already used"
+    # A second member disagreeing about the base layout is refused: its ΔB is not even the shape its
+    # own declared base implies, so nothing could cancel coordinate-wise.
+    other = {KEY: (OUT + 2, IN)}
+    assert _stage(agg, rnd, uploads[1][0], delta.compat_from_shapes(other), spec_json, tokens[1],
+                  base_json=delta.base_to_json(other)).endswith("does not match its base module (8, 4)")
     print("PASS test_rejects_bad_uploads")
 
 
 def test_serve_global_cursor(tmp_path):
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
-    uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    rnd, tokens = _seal_with(agg, pubs)
-    for token, (masked, compat, spec_json) in zip(tokens, uploads):
-        _stage(agg, rnd, masked, compat, spec_json, token)
-    _finalize(agg, rnd)
+    agg = _agg(tmp_path, k_min=2, k_target=2)
+    _round(agg, [_dB() for _ in range(2)])
     assert agg.serve_global("m", "1") is None            # since == current version ⇒ nothing new
     assert agg.serve_global("m", "") is not None
     assert agg.serve_global("other", "") is None         # unknown model
@@ -190,9 +291,9 @@ def test_concurrent_cohorts_per_model(tmp_path):
     # While cohort A is sealed and collecting, new registrants must form a SEPARATE cohort B (not be
     # rejected), and the two collect + finalize independently, each routed by its own round_id.
     torch.manual_seed(4)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    payloads_a = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
-    payloads_b = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
+    agg = _agg(tmp_path, k_min=2, k_target=2)
+    payloads_a = [_dB() for _ in range(2)]
+    payloads_b = [_dB() for _ in range(2)]
     up_a, pubs_a = _mask_cohort(payloads_a)
     up_b, pubs_b = _mask_cohort(payloads_b)
 
@@ -210,22 +311,38 @@ def test_concurrent_cohorts_per_model(tmp_path):
     _finalize(agg, rnd_b)
 
     blob, version = _pull(agg)
-    expected = (sum(p[KEY] for p in payloads_a) + sum(p[KEY] for p in payloads_b)) / 2  # two rounds of mean
-    assert version == 2 and torch.allclose(delta.from_bytes(blob)[0][KEY], expected, atol=1e-2)
+    expected = (sum(p[B_KEY] for p in payloads_a) + sum(p[B_KEY] for p in payloads_b)) / 2
+    assert version == 2 and torch.allclose(delta.from_bytes(blob)[0][B_KEY], expected, atol=1e-4)
     print("PASS test_concurrent_cohorts_per_model")
 
 
+def test_late_cohort_voids_across_an_epoch_boundary(tmp_path):
+    # Two cohorts sealed in the same epoch, but the first fold advances it: the second's ΔB was trained
+    # against the A that just stopped being frozen, so its fold is refused instead of corrupting G.
+    torch.manual_seed(8)
+    agg = _agg(tmp_path, k_min=2, k_target=2, epoch_folds=1)
+    up_a, pubs_a = _mask_cohort([_dB() for _ in range(2)])
+    up_b, pubs_b = _mask_cohort([_dB() for _ in range(2)])
+    rnd_a, tok_a = _seal_with(agg, pubs_a)
+    rnd_b, tok_b = _seal_with(agg, pubs_b)
+    for rnd, tokens, ups in ((rnd_a, tok_a, up_a), (rnd_b, tok_b, up_b)):
+        for token, (masked, compat, spec_json) in zip(tokens, ups):
+            _stage(agg, rnd, masked, compat, spec_json, token)
+    _finalize(agg, rnd_a)
+    _finalize(agg, rnd_b)
+    assert _pull(agg)[1] == 1                    # only cohort A landed; B voided on the stale epoch
+    print("PASS test_late_cohort_voids_across_an_epoch_boundary")
+
+
 def test_global_persists_across_restart(tmp_path):
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
-    uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=2)
-    rnd, tokens = _seal_with(agg, pubs)
-    for token, (masked, compat, spec_json) in zip(tokens, uploads):
-        _stage(agg, rnd, masked, compat, spec_json, token)
-    _finalize(agg, rnd)
-    reloaded = Aggregator(str(tmp_path))                  # fresh instance serves from storage, no eager load
+    agg = _agg(tmp_path, k_min=2, k_target=2, epoch_folds=1)
+    _round(agg, [_dB() for _ in range(2)])
+    reloaded = _agg(tmp_path)                             # fresh instance serves from storage, no eager load
     blob, version = _pull(reloaded)
-    assert version == 1 and KEY in delta.from_bytes(blob)[0]
+    assert version == 1 and B_KEY in delta.from_bytes(blob)[0]
+    # The factor state (which epoch/phase, at which rank) rides in the global's metadata, so a restarted
+    # server keeps telling clients to train the same factor.
+    assert reloaded.state("m") == {"epoch": 1, "phase": "A", "folds": 0, "rank": RANK, "compat": COMPAT}
     print("PASS test_global_persists_across_restart")
 
 
@@ -253,18 +370,14 @@ def test_s3_backend_round_trip(tmp_path, monkeypatch):
         boto3.client("s3", endpoint_url=endpoint, region_name="us-east-1",
                      aws_access_key_id="k", aws_secret_access_key="s").create_bucket(Bucket="roger-test")
 
-        payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(2)]
-        uploads, pubs = _mask_cohort(payloads)
-        agg = Aggregator(str(tmp_path), k_min=2, k_target=2)   # datadir is unused by the s3 backend
-        rnd, tokens = _seal_with(agg, pubs)
-        for token, (masked, compat, spec_json) in zip(tokens, uploads):
-            _stage(agg, rnd, masked, compat, spec_json, token)
-        _finalize(agg, rnd)
+        payloads = [_dB() for _ in range(2)]
+        agg = _agg(tmp_path, k_min=2, k_target=2)          # datadir is unused by the s3 backend
+        _round(agg, payloads)
 
-        reloaded = Aggregator(str(tmp_path))               # cold start: rehydrate from object storage only
+        reloaded = _agg(tmp_path)                          # cold start: rehydrate from object storage only
         blob, version = _pull(reloaded)
-        expected = sum(p[KEY] for p in payloads) / 2
-        assert version == 1 and torch.allclose(delta.from_bytes(blob)[0][KEY], expected, atol=1e-2)
+        expected = sum(p[B_KEY] for p in payloads) / 2
+        assert version == 1 and torch.allclose(delta.from_bytes(blob)[0][B_KEY], expected, atol=1e-4)
         assert not list(tmp_path.iterdir())                # s3 mode never touches local disk
     print("PASS test_s3_backend_round_trip")
 
@@ -272,68 +385,70 @@ def test_s3_backend_round_trip(tmp_path, monkeypatch):
 # --- bootstrap (async DP) mode ---------------------------------------------------------------
 
 def test_dp_bootstrap_accumulates(tmp_path):
-    # A single unmasked dense ΔW folds straight into the global (k=1), no cohort. Two async uploads
-    # accumulate as Σ η_boot·clip(ΔW).
+    # A single unmasked factor Δ folds straight into the global (k=1), no cohort. Two async uploads
+    # accumulate as Σ η_boot·ΔB.
     torch.manual_seed(5)
-    agg = Aggregator(str(tmp_path), eta=1.0, clip_norm=10.0)   # high clip ⇒ no scaling, exact sum
-    d1 = {KEY: torch.randn(6, 4) * 0.05}
-    d2 = {KEY: torch.randn(6, 4) * 0.05}
-    assert agg.submit_dp("m", d1, "1.1.1.1", now=0.0) == "ok"
-    assert agg.submit_dp("m", d2, "2.2.2.2", now=1.0) == "ok"
-    blob, version = _pull(agg)
-    tensors, _ = delta.from_bytes(blob)
-    assert version == 2 and torch.allclose(tensors[KEY], d1[KEY] + d2[KEY], atol=1e-2)
+    agg = _agg(tmp_path, eta=1.0, clip_norm=10.0)   # high clip ⇒ no scaling, exact sum
+    d1, d2 = _dB(), _dB()
+    assert agg.submit_dp("m", d1, BASE, "1.1.1.1", now=0.0) == "ok"
+    assert agg.submit_dp("m", d2, BASE, "2.2.2.2", now=1.0) == "ok"
+    tensors, _ = _global(agg)
+    assert _pull(agg)[1] == 2
+    assert torch.allclose(tensors[B_KEY], d1[B_KEY] + d2[B_KEY], atol=1e-4)
     print("PASS test_dp_bootstrap_accumulates")
 
 
 def test_dp_bootstrap_norm_bound_and_rejects(tmp_path):
-    agg = Aggregator(str(tmp_path), clip_norm=1.0, eta=1.0)
-    big = {KEY: torch.randn(6, 4) * 5.0}                       # ‖ΔW‖ ≫ 1 ⇒ over bound ⇒ void
-    assert agg.submit_dp("m", big, "1.1.1.1", now=0.0) == "norm exceeded"
+    agg = _agg(tmp_path, clip_norm=1.0, eta=1.0)
+    assert agg.submit_dp("m", _dB(5.0), BASE, "1.1.1.1", now=0.0) == "norm exceeded"   # ‖ΔB‖ ≫ 1 ⇒ void
     assert _pull(agg) is None                                 # nothing folded
-    small = {KEY: torch.randn(6, 4) * 0.05}                   # within bound ⇒ folds, establishes G
-    assert agg.submit_dp("m", small, "1.1.1.1", now=1.0) == "ok"
-    # a key whose shape disagrees with the established global is refused (would corrupt the sum)
-    assert agg.submit_dp("m", {KEY: torch.randn(8, 4)}, "1.1.1.1", now=2.0) == "shape mismatch"
-    assert agg.submit_dp("m", {KEY: torch.full((6, 4), float("nan"))}, "1.1.1.1", now=3.0) == "non-finite delta"
+    assert agg.submit_dp("m", _dB(), BASE, "1.1.1.1", now=1.0) == "ok"   # within bound ⇒ folds, sets G
+    # a base whose shapes disagree with the established global is refused (would corrupt the sum)
+    other = {KEY: (OUT + 2, IN)}
+    assert agg.submit_dp("m", {B_KEY: torch.randn(OUT + 2, RANK)}, other, "1.1.1.1", now=2.0) == "compat mismatch"
+    assert agg.submit_dp("m", {B_KEY: torch.full((OUT, RANK), float("nan"))}, BASE,
+                         "1.1.1.1", now=3.0) == "non-finite delta"
     print("PASS test_dp_bootstrap_norm_bound_and_rejects")
 
 
 def test_dp_bootstrap_bf16(tmp_path):
-    # The real client uploads bf16 ΔW (densify casts to the factor dtype); the staged per-module reader
-    # must read bf16 back. f32 tests don't exercise that path.
-    agg = Aggregator(str(tmp_path), eta=1.0, clip_norm=10.0)
-    dW = {KEY: (torch.randn(6, 4) * 0.05).to(torch.bfloat16)}
-    assert agg.submit_dp("m", dW, "1.1.1.1", now=0.0) == "ok"
-    tensors, _ = delta.from_bytes(_pull(agg)[0])
-    assert torch.allclose(tensors[KEY], dW[KEY].float(), atol=1e-2)   # bf16 round-trip precision
+    # A client may upload bf16 factors (training dtype); the staged per-module reader must read them
+    # back. f32 tests don't exercise that path.
+    agg = _agg(tmp_path, eta=1.0, clip_norm=10.0)
+    dB = {B_KEY: (torch.randn(OUT, RANK) * 0.05).to(torch.bfloat16)}
+    assert agg.submit_dp("m", dB, BASE, "1.1.1.1", now=0.0) == "ok"
+    tensors, _ = _global(agg)
+    assert torch.allclose(tensors[B_KEY], dB[B_KEY].float(), atol=1e-2)   # bf16 round-trip precision
     print("PASS test_dp_bootstrap_bf16")
 
 
 def test_mode_flips_at_density_threshold(tmp_path):
-    agg = Aggregator(str(tmp_path), busy_threshold=3, busy_window=100.0)
+    agg = _agg(tmp_path, busy_threshold=3, busy_window=100.0)
     assert agg.mode("m", now=0.0) == "bootstrap"               # nothing seen yet
     for i, ip in enumerate(["a", "b"]):
-        agg.submit_dp("m", {KEY: torch.randn(6, 4) * 0.01}, ip, now=float(i))
+        agg.submit_dp("m", _dB(0.01), BASE, ip, now=float(i))
     assert agg.mode("m", now=2.0) == "bootstrap"               # only 2 distinct contributors < 3
-    agg.submit_dp("m", {KEY: torch.randn(6, 4) * 0.01}, "c", now=3.0)
+    agg.submit_dp("m", _dB(0.01), BASE, "c", now=3.0)
     assert agg.mode("m", now=3.0) == "busy"                    # 3rd distinct contributor ⇒ busy
     assert agg.mode("m", now=3.0 + 200.0) == "bootstrap"       # all aged out of the window ⇒ sparse again
     print("PASS test_mode_flips_at_density_threshold")
 
 
-def test_default_quorum_is_three(tmp_path):
+def test_defaults(tmp_path):
     agg = Aggregator(str(tmp_path))
     assert agg.k_min == 3 and agg.k_target == 5
-    print("PASS test_default_quorum_is_three")
+    assert agg.rank == 16 and agg.epoch_folds == 20
+    # A model nobody has contributed to yet still has a well-defined factor state to train against.
+    assert agg.state("fresh") == {"epoch": 0, "phase": "B", "folds": 0, "rank": 16, "compat": None}
+    print("PASS test_defaults")
 
 
 def test_allowlist_reports_unsupported(tmp_path):
     # An allowlisted model keeps the density logic; an excluded one reports "unsupported" at /status so
-    # the client can warn + skip rather than waste a densify+upload the 403/400 would reject anyway.
+    # the client can warn + skip rather than waste a training round the 403/400 would reject anyway.
     from fastapi.testclient import TestClient
     from roger_server.app import create_app
-    agg = Aggregator(str(tmp_path), allowlist={"ok"})
+    agg = _agg(tmp_path, allowlist={"ok"})
     assert agg.mode("ok", now=0.0) == "bootstrap"
     assert agg.mode("nope", now=0.0) == "unsupported"
     with TestClient(create_app(agg)) as client:
@@ -341,8 +456,8 @@ def test_allowlist_reports_unsupported(tmp_path):
         assert body["mode"] == "unsupported" and body["models"] == ["ok"]   # the list is what's actionable
         assert client.get("/status", params={"model_id": "ok"}).json()["mode"] == "bootstrap"
     # No allowlist ⇒ every model is supported (never "unsupported"), advertised as models: null.
-    assert Aggregator(str(tmp_path), allowlist=None).mode("anything", now=0.0) == "bootstrap"
-    with TestClient(create_app(Aggregator(str(tmp_path), allowlist=None))) as client:
+    assert _agg(tmp_path, allowlist=None).mode("anything", now=0.0) == "bootstrap"
+    with TestClient(create_app(_agg(tmp_path, allowlist=None))) as client:
         assert client.get("/status", params={"model_id": "anything"}).json()["models"] is None
     print("PASS test_allowlist_reports_unsupported")
 
@@ -352,13 +467,12 @@ def test_status_advertises_client_version(tmp_path, monkeypatch):
     # an out-of-date client self-skips + nudges an update. Absent env ⇒ 0 (no opinion), never blocks.
     from fastapi.testclient import TestClient
     from roger_server.app import create_app
-    agg = Aggregator(str(tmp_path))
-    with TestClient(create_app(agg)) as client:
+    with TestClient(create_app(_agg(tmp_path))) as client:
         body = client.get("/status", params={"model_id": "m"}).json()
         assert body["min_client"] == 0 and body["latest_client"] == 0
     monkeypatch.setenv("ROGER_MIN_CLIENT", "3")
     monkeypatch.setenv("ROGER_LATEST_CLIENT", "5")
-    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+    with TestClient(create_app(_agg(tmp_path))) as client:
         body = client.get("/status", params={"model_id": "m"}).json()
         assert body["min_client"] == 3 and body["latest_client"] == 5
     print("PASS test_status_advertises_client_version")
@@ -369,7 +483,7 @@ def test_healthz_reports_store(tmp_path):
     from fastapi.testclient import TestClient
     from roger_server.app import create_app
     assert store.health_check(str(tmp_path)) == "ok"
-    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+    with TestClient(create_app(_agg(tmp_path))) as client:
         r = client.get("/healthz")
         assert r.status_code == 200 and r.json()["storage"] == "ok"
     print("PASS test_healthz_reports_store")
@@ -379,7 +493,7 @@ def test_register_rejects_malformed_json(tmp_path):
     # A malformed body must be a clean 400, not a 500 from the unguarded req.json().
     from fastapi.testclient import TestClient
     from roger_server.app import create_app
-    with TestClient(create_app(Aggregator(str(tmp_path)))) as client:
+    with TestClient(create_app(_agg(tmp_path))) as client:
         r = client.post("/round/register", content=b"{not json",
                         headers={"Content-Type": "application/json"})
         assert r.status_code == 400
@@ -390,7 +504,19 @@ def test_absent_global(tmp_path):
     assert store.open_global_reader(str(tmp_path), "nope") is None   # never-folded model ⇒ None, not a crash
     assert store.open_global_stream(str(tmp_path), "nope") is None
     assert store.load_version(str(tmp_path), "nope") == 0
+    assert store.load_meta(str(tmp_path), "nope") == {}
     print("PASS test_absent_global")
+
+
+def test_seeded_A_is_stable_and_shaped(tmp_path):
+    # The frozen A a cold federation starts from is DERIVED on both sides, so it must be reproducible
+    # bit-for-bit and distinct per (model, module).
+    a1 = delta.init_A("m", KEY, RANK, IN)
+    assert a1.shape == (RANK, IN) and a1.dtype == torch.float32
+    assert torch.equal(a1, delta.init_A("m", KEY, RANK, IN))
+    assert not torch.equal(a1, delta.init_A("other", KEY, RANK, IN))
+    assert a1.abs().max() <= 1.0 / IN ** 0.5                  # PEFT's kaiming-uniform bound
+    print("PASS test_seeded_A_is_stable_and_shaped")
 
 
 # --- HTTP wire layer + seal barrier ----------------------------------------------------------
@@ -403,11 +529,15 @@ def test_http_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("ROGER_AGG_W", "10")              # bound any hang if requests serialized
     torch.manual_seed(3)
     N = 3
-    payloads = [{KEY: torch.randn(6, 4) * 0.05} for _ in range(N)]
+    payloads = [_dB() for _ in range(N)]
     uploads, pubs = _mask_cohort(payloads)
-    agg = Aggregator(str(tmp_path), k_min=2, k_target=N)
+    agg = _agg(tmp_path, k_min=2, k_target=N)
 
     with TestClient(create_app(agg)) as client:
+        # What the client reads right before training: which factor, at which rank, in which epoch.
+        st = client.get("/status", params={"model_id": "m"}).json()
+        assert (st["phase"], st["rank"], st["epoch"]) == ("B", RANK, 0)
+
         # Concurrent registration: the cohort seals once all N are in-flight, returning the same peers.
         with ThreadPoolExecutor(max_workers=N) as ex:
             regs = list(ex.map(
@@ -421,14 +551,18 @@ def test_http_end_to_end(tmp_path, monkeypatch):
 
         for token, (masked, compat, spec_json) in zip(tokens, uploads):
             r = client.post("/contribute",
-                            content=_pack(masked, compat, spec_json, round_id, token=token),
+                            content=_pack(masked, compat, spec_json, round_id, token=token,
+                                          epoch=st["epoch"]),
                             headers={"Content-Type": "application/octet-stream"})
             assert r.status_code == 200
 
         r = client.get("/global", params={"model_id": "m", "since": ""})
         assert r.status_code == 200
-        tensors, _ = delta.from_bytes(r.content)
-        assert torch.allclose(tensors[KEY], sum(p[KEY] for p in payloads) / N, atol=1e-2)
+        tensors, meta = delta.from_bytes(r.content)
+        # The broadcast is the adapter itself: both factors, scale already folded in.
+        assert torch.allclose(tensors[B_KEY], sum(p[B_KEY] for p in payloads) / N, atol=1e-4)
+        assert torch.equal(tensors[A_KEY], delta.init_A("m", KEY, RANK, IN))
+        assert meta["scaling"] == "1"
         cursor = r.headers["X-Cursor"]
         assert client.get("/global", params={"model_id": "m", "since": cursor}).status_code == 204
     print("PASS test_http_end_to_end")
@@ -440,17 +574,21 @@ def test_http_bootstrap_path(tmp_path):
     from roger_server.app import create_app
 
     torch.manual_seed(6)
-    agg = Aggregator(str(tmp_path), busy_threshold=3, clip_norm=10.0)
+    agg = _agg(tmp_path, busy_threshold=3, clip_norm=10.0)
     with TestClient(create_app(agg)) as client:
-        # A fresh model is sparse ⇒ /status says bootstrap; the client uploads an unmasked dense ΔW.
+        # A fresh model is sparse ⇒ /status says bootstrap; the client uploads one unmasked factor Δ.
         assert client.get("/status", params={"model_id": "m"}).json()["mode"] == "bootstrap"
-        dW = {KEY: torch.randn(6, 4) * 0.05}
-        blob = delta.to_bytes(dW, "m")
-        r = client.post("/contribute_dp", content=blob, headers={"Content-Type": "application/octet-stream"})
+        dB = _dB()
+        r = client.post("/contribute_dp", content=_dp(factors=dB),
+                        headers={"Content-Type": "application/octet-stream"})
         assert r.status_code == 200
+        # An upload stamped with the wrong epoch never reaches the global.
+        r = client.post("/contribute_dp", content=_dp(factors=_dB(), epoch=9),
+                        headers={"Content-Type": "application/octet-stream"})
+        assert r.status_code == 400 and "stale epoch" in r.text
         g = client.get("/global", params={"model_id": "m", "since": ""})
         assert g.status_code == 200
-        assert torch.allclose(delta.from_bytes(g.content)[0][KEY], dW[KEY], atol=1e-2)
+        assert torch.allclose(delta.from_bytes(g.content)[0][B_KEY], dB[B_KEY], atol=1e-4)
     print("PASS test_http_bootstrap_path")
 
 
@@ -462,6 +600,8 @@ if __name__ == "__main__":
     test_norm_bound_voids_aggregate(d / "e"); test_rejects_bad_uploads(d / "f")
     test_serve_global_cursor(d / "g"); test_global_persists_across_restart(d / "h")
     test_dp_bootstrap_accumulates(d / "i"); test_dp_bootstrap_norm_bound_and_rejects(d / "j")
-    test_mode_flips_at_density_threshold(d / "k"); test_default_quorum_is_three(d / "l")
+    test_mode_flips_at_density_threshold(d / "k"); test_defaults(d / "l")
     test_absent_global(d / "m"); test_dp_bootstrap_bf16(d / "n")
-    test_allowlist_reports_unsupported(d / "o")
+    test_allowlist_reports_unsupported(d / "o"); test_epoch_swaps_the_trained_factor(d / "p")
+    test_per_module_rank_map(d / "s")
+    test_late_cohort_voids_across_an_epoch_boundary(d / "q"); test_seeded_A_is_stable_and_shaped(d / "r")

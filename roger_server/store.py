@@ -1,8 +1,10 @@
 """store.py — durable global persistence + per-round upload staging (fs | s3, via ROGER_SERVER_STORAGE).
 
-Durable state is the global `G = Σ η·mean(ΔW)`, stored as the dense-ΔW safetensors blob the client pulls
-(`delta.to_bytes` layout) + a version int (the /global cursor). s3 is what makes scale-to-zero safe (the
-container disk is RAM-backed tmpfs and vanishes); the container holds the creds, clients never touch it.
+Durable state is the global LoRA adapter (the `lora_A`/`lora_B` factor pair per module, `delta.to_bytes`
+layout) that the client pulls and attaches, + a version int (the /global cursor). Its safetensors
+metadata also carries the federation's factor state (`rank`, `epoch`, `folds`), so which factor clients
+train next survives a scale-to-zero. s3 is what makes that safe (the container disk is RAM-backed tmpfs
+and vanishes); the container holds the creds, clients never touch it.
 
 Uploads are STAGED here one temp object each (`stage_*`) and folded one module at a time
 (`open_global_reader` + streamed multipart `GlobalWriter`) so RAM is ~one matrix, not the whole model —
@@ -13,7 +15,8 @@ import hashlib, json, os, re, shutil, struct, uuid
 
 import torch
 
-# safetensors dtype codes <-> torch. The server only ever serializes F32 globals and reads I64 uploads.
+# safetensors dtype codes <-> torch. The server serializes F32 globals and reads I64 (masked cohort) or
+# F32/BF16 (bootstrap) uploads.
 _DTYPE_CODE = {torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16", torch.int64: "I64"}
 _CODE_DTYPE = {v: k for k, v in _DTYPE_CODE.items()}
 _DTYPE_SIZE = {"F32": 4, "F16": 2, "BF16": 2, "I64": 8}
@@ -258,12 +261,13 @@ def health_check(datadir: str) -> str:
         w.commit()
         if _stage_read(datadir, rid, slot, 0, len(probe)) != probe:
             return "stage readback mismatch"
-        gw = global_writer(datadir, probe_mid, [("probe", "F32", (2, 2))])   # (2) global publish
+        gw = global_writer(datadir, probe_mid,                                # (2) global publish
+                           [("probe.lora_A.weight", "F32", (2, 2))])
         gw.write(torch.zeros(2, 2, dtype=torch.float32).numpy().tobytes())
         gw.commit(1)
         gw = None                                      # committed; nothing to abort
         r = open_global_reader(datadir, probe_mid)
-        if r is None or "probe" not in r.keys:
+        if r is None or "probe.lora_A.weight" not in r.keys:
             return "global readback missing"
         return "ok"
     except Exception as e:
@@ -289,18 +293,19 @@ def _fs_range(path: str, start: int, length: int) -> bytes:
 
 def _reader_at(get_range):
     """Lazy per-module reader over a safetensors blob addressed by get_range(start,length)->bytes, or
-    None if the blob is absent (the first read raises). Used for both the global and a staged DP blob —
-    same dense layout. `.keys` is {key:(code,shape)}; `.read(key)` range-reads just that module."""
+    None if the blob is absent (the first read raises). Used for both the global and a staged bootstrap
+    blob — same layout. `.keys` is {key:(code,shape)}, `.meta` the blob's `__metadata__`; `.read(key)`
+    range-reads just that module."""
     try:
         n = struct.unpack("<Q", get_range(0, 8))[0]
         head = get_range(0, 8 + n)
     except Exception:
         return None
-    tensors, _, data_start = _parse_header(head)
+    tensors, meta, data_start = _parse_header(head)
     def rd(key):
         code, shape, b, e = tensors[key]
         return _slice_to_tensor(get_range(data_start + b, e - b), code, shape)
-    return _Reader(tensors, rd)
+    return _Reader(tensors, meta, rd)
 
 
 def open_global_reader(datadir: str, model_id: str):
@@ -313,7 +318,7 @@ def open_global_reader(datadir: str, model_id: str):
 
 
 def open_staged_reader(datadir: str, round_id: str, slot: str):
-    """Per-module reader over a staged DP upload (a dense-ΔW blob, same format as the global)."""
+    """Per-module reader over a staged bootstrap upload (one factor's Δ, same blob format as the global)."""
     if _backend() == "s3":
         client, bucket, prefix = _s3_conf()
         key = _tmp_key(prefix, round_id, slot)
@@ -323,19 +328,28 @@ def open_staged_reader(datadir: str, round_id: str, slot: str):
 
 
 class _Reader:
-    def __init__(self, tensors: dict, rd):
+    def __init__(self, tensors: dict, meta: dict, rd):
         self.keys = {k: (code, shape) for k, (code, shape, _, _) in tensors.items()}
+        self.meta = meta
         self._rd = rd
     def read(self, key: str) -> torch.Tensor:
         return self._rd(key)
 
 
-def global_writer(datadir: str, model_id: str, specs: list):
+def load_meta(datadir: str, model_id: str) -> dict:
+    """The stored global's `__metadata__` (rank/epoch/folds/compat), or {} when no global exists yet.
+    Header-only: one small range read, not the blob."""
+    reader = open_global_reader(datadir, model_id)
+    return dict(reader.meta) if reader is not None else {}
+
+
+def global_writer(datadir: str, model_id: str, specs: list, meta: dict | None = None):
     """Open a streamed builder for the new global. specs = [(key, code, shape), ...] in write order;
     `.write(bytes)` appends each module's data in that order; `.commit(version)` atomically publishes
-    the blob + version. The whole global is never resident."""
-    metadata = {"model_id": model_id,
-                "compat": _compat(specs)}
+    the blob + version. `meta` is the federation's factor state (rank/epoch/folds/scaling), which rides
+    in the blob's metadata so it is as durable as the global itself. The whole global is never
+    resident."""
+    metadata = {"model_id": model_id, "compat": _compat(specs), **(meta or {})}
     header = _build_header(specs, metadata)
     if _backend() == "s3":
         client, bucket, prefix = _s3_conf()
@@ -360,8 +374,20 @@ def global_writer(datadir: str, model_id: str, specs: list):
 
 
 def _compat(specs: list) -> str:
+    """The global is written as lora_A [r, in] / lora_B [out, r] pairs, so recover each module's
+    (out, in) from its pair before digesting."""
     from roger_server import delta
-    return delta.compat_from_shapes({key: tuple(shape) for key, _, shape in specs})
+    shapes = {}
+    for key, _, shape in specs:
+        module = delta.module_of(key)
+        if module is None:
+            continue
+        pair = shapes.setdefault(module, [0, 0])
+        if key.endswith(delta.LORA_A):
+            pair[1] = shape[1]
+        else:
+            pair[0] = shape[0]
+    return delta.compat_from_shapes(shapes)
 
 
 class _GlobalWriter:

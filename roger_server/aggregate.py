@@ -4,24 +4,32 @@ Lock-held methods (register, seal, stage bookkeeping, claim_finalize) run with n
 atomic under the single event-loop thread; the I/O-heavy `run_finalize` runs OFF it in a threadpool,
 touching only a round already pulled from `collecting` + storage, so it can't race the lock-held state.
 
+What is aggregated is ONE LoRA factor per epoch (`delta.py`): in a B-epoch every member trains B
+against the same frozen A, uploads ΔB, and the server folds G_B += η·mean(ΔB); an A-epoch mirrors it.
+That is what makes secure aggregation exact here — the server only ever sees Σ Δ, and Σ(ΔB_i)·A =
+Σ(ΔB_i·A), while summing whole factor PAIRS would leave the cross terms B_i A_j behind. The epoch
+advances after `epoch_folds` successful folds and is stamped on every upload, so an update trained in
+a past epoch (against a factor that has since moved) is voided rather than folded.
+
 Lifecycle (per model_id, one registering round at a time; on seal it gets a round_id and moves aside,
 so cohorts collect concurrently, self-routed by round_id):
   REGISTERING  /round/register collects X25519 pubkeys, issuing each registrant a secret upload token.
-  -> sealed    at K_target, or at the W deadline if >= K_min (else FAILED: sub-K_min leaks a lone ΔW).
+  -> sealed    at K_target, or at the W deadline if >= K_min (else FAILED: sub-K_min leaks a lone Δ).
   COLLECTING   /contribute streams each masked upload to its OWN temp object (never a RAM running-sum),
                gated on the registrant's token so only cohort members upload, each at most once.
   -> finalized all uploaded, or U deadline: sum staged slices per module (masks cancel), fold into the
-               global, voiding if ‖ΣΔW‖ exceeds k·clip. Masks cancel only if EVERY member uploaded.
+               global, voiding if ‖ΣΔ‖ exceeds k·clip. Masks cancel only if EVERY member uploaded.
 
-Staging (not a RAM running-sum) because a masked vector spans the full dense basis: `8·P_target` bytes
-resident for the whole window × concurrent cohorts overruns serverless tiers; per-module keeps RAM ~one
-matrix. Bootstrap (sparse `mode()`): one unmasked DP ΔW to /contribute_dp, `dp_fold` (k=1) — the same
-per-module streamed fold, just no cohort.
+Staging (not a RAM running-sum) because a masked vector spans the epoch's whole factor basis, and a
+cohort's worth of those resident for the whole window × concurrent cohorts overruns serverless tiers;
+per-module keeps RAM ~one factor. Bootstrap (sparse `mode()`): one unmasked DP Δ to /contribute_dp,
+`dp_fold` (k=1) — the same per-module streamed fold, just no cohort.
 """
 import json, secrets, uuid
 
 import torch
 
+from roger_server import delta
 from roger_server import secure_agg
 from roger_server import store
 
@@ -45,7 +53,9 @@ class Round:
         self.sealed_peers: list[str] | None = None
         # set by the first valid contribution; the cohort must agree on layout for masks to cancel
         self.compat: str | None = None
-        self.spec: list | None = None           # [(module_key, shape_tuple), ...]
+        self.base: dict | None = None           # {module: (out, in)} of the base this cohort targets
+        self.epoch: int | None = None           # the epoch every member of this cohort trained in
+        self.spec: list | None = None           # [(factor_key, shape_tuple), ...]
         self.length: int | None = None
         self.staged: set = set()                # slot ids of fully-uploaded temp objects
         self.inflight = 0                       # reservations whose upload is still streaming
@@ -75,28 +85,31 @@ class Aggregator:
     def __init__(self, datadir: str, *, k_min: int = 3, k_target: int = 5, eta: float = 1.0,
                  eta_boot: float | None = None, clip_norm: float = 1.0,
                  allowlist: set | None = None, busy_threshold: int | None = None,
-                 busy_window: float = 180.0):
+                 busy_window: float = 180.0, rank: int = 16, epoch_folds: int = 20):
         self.datadir = datadir
         self.k_min = k_min
         self.k_target = k_target
-        self.eta = eta                          # server learning rate: G <- G + η·mean(ΔW)
+        self.eta = eta                          # server learning rate: G <- G + η·mean(Δ)
         self.eta_boot = eta if eta_boot is None else eta_boot  # rate for a single async DP upload
         self.clip_norm = clip_norm              # aggregate L2 cap (honest cohort sums to ≤ k·clip_norm)
         self.allowlist = allowlist              # None = accept any model_id
         self.busy_threshold = k_target if busy_threshold is None else busy_threshold
         self.busy_window = busy_window
+        self.rank = rank                        # rank CAP a NEW model's global is created at (delta.rank_for)
+        self.epoch_folds = epoch_folds          # folds per epoch before the trained factor swaps
         self.recent: dict[str, dict[str, float]] = {}  # model_id -> {ip: last-seen monotonic time}
         self.registering: dict[str, Round] = {} # model_id -> the round open for registration
         self.collecting: dict[str, Round] = {}  # round_id -> a sealed round awaiting uploads (many at once)
+        self._state: dict[str, dict] = {}       # model_id -> cached factor state (see `state`)
 
     # --- mode / density ---------------------------------------------------------------------
 
     def mode(self, model_id: str, now: float) -> str:
         """"unsupported" when an allowlist is set and excludes this model — surfaced here (not only as the
         register/contribute 403) so a client can warn the user up front + skip, instead of wasting a
-        session's densify+upload on a gradient no federation will take. Else "busy" (secure-agg cohorts)
-        once >= busy_threshold distinct contributors fall inside the busy_window, else "bootstrap" (async
-        DP). Prunes the window in passing."""
+        session's training and upload on a gradient no federation will take. Else "busy" (secure-agg
+        cohorts) once >= busy_threshold distinct contributors fall inside the busy_window, else
+        "bootstrap" (async DP). Prunes the window in passing."""
         if self.allowlist is not None and model_id not in self.allowlist:
             return "unsupported"                # permanent + actionable, unlike a transient seal failure
         seen = self.recent.get(model_id)
@@ -109,6 +122,59 @@ class Aggregator:
 
     def _note_contributor(self, model_id: str, ip: str, now: float) -> None:
         self.recent.setdefault(model_id, {})[ip] = now
+
+    # --- factor state (which factor to train, at which rank, in which epoch) -----------------
+
+    def state(self, model_id: str) -> dict:
+        """The federation's factor state for a model: {epoch, phase, rank, folds, compat}. It is durable
+        in the global's metadata; cached here because the server is single-instance by construction, so
+        nothing else can move it (every fold updates the cache in the same breath as the blob). Does
+        storage I/O on a cache miss, so callers hold no lock while warming it."""
+        st = self._state.get(model_id)
+        if st is None:
+            meta = store.load_meta(self.datadir, model_id)
+            epoch = int(meta.get("epoch", 0))
+            st = {"epoch": epoch, "phase": delta.phase_of(epoch), "folds": int(meta.get("folds", 0)),
+                  "rank": int(meta.get("rank", self.rank)),   # the CAP; a stored global keeps its own
+                  "compat": meta.get("compat")}
+            self._state[model_id] = st
+        return st
+
+    def round_model(self, round_id: str) -> str | None:
+        """The model a collecting round belongs to (so the wire layer can warm `state` before locking)."""
+        rnd = self.collecting.get(round_id)
+        return rnd.model_id if rnd is not None else None
+
+    def check_upload(self, model_id: str, compat: str, base_json: str, epoch: int, spec: list) -> tuple:
+        """Shared validation for both upload paths. Returns ({module: (out, in)}, "ok") or (None, error).
+        An upload must target this model's current epoch (so its frozen factor is the one still in the
+        global), carry only that epoch's factor at the federation's rank, and agree with the stored
+        global's base shapes — otherwise it is not addable to the global at all."""
+        st = self.state(model_id)
+        if epoch != st["epoch"]:
+            return None, "stale epoch"          # trained against a factor the federation has moved past
+        base = delta.base_from_json(base_json)
+        if not base or delta.compat_from_shapes(base) != compat:
+            return None, "bad base shapes"      # `base` must be exactly what `compat` digests
+        if st["compat"] is not None and compat != st["compat"]:
+            return None, "compat mismatch"      # a different architecture claiming this model_id
+        if not spec:
+            return None, "empty delta"
+        suffix, cap = delta.SUFFIX[st["phase"]], st["rank"]
+        for key, shape in spec:
+            module = delta.module_of(key)
+            if module is None or not key.endswith(suffix):
+                return None, f"expected {st['phase']}-factor updates this epoch"
+            if module not in base or len(shape) != 2:
+                return None, "unknown module"
+            out_dim, in_dim = base[module]
+            rank = delta.rank_for(out_dim, in_dim, cap)   # the map is a pure function of shape + cap
+            want = (rank, in_dim) if suffix == delta.LORA_A else (out_dim, rank)
+            if tuple(shape) != want:
+                got_rank = shape[0] if suffix == delta.LORA_A else shape[1]
+                return None, (f"rank mismatch ({module} trains at rank {rank} here)" if got_rank != rank
+                              else f"{key} does not match its base module {base[module]}")
+        return base, "ok"
 
     # --- registration / sealing -------------------------------------------------------------
 
@@ -143,8 +209,8 @@ class Aggregator:
 
     # --- contribution staging (lock-held bookkeeping; the I/O is in app.py) ------------------
 
-    def begin_stage(self, round_id: str, compat: str, spec_json: str, token: str, *,
-                    masked_i64: bool = True, masked_len: int | None = None) -> tuple:
+    def begin_stage(self, round_id: str, compat: str, spec_json: str, base_json: str, epoch: int,
+                    token: str, *, masked_i64: bool = True, masked_len: int | None = None) -> tuple:
         """Validate an incoming upload and reserve a slot. Returns (round, slot_id, "ok") or
         (None, None, error). The caller streams the body to `store.stage_writer(.., round_id, slot)`,
         then calls mark_received (success) or unreserve (failure). `token` must be the secret this
@@ -165,9 +231,12 @@ class Aggregator:
         spec, length = _parse_spec(spec_json)
         if masked_len is not None and masked_len != length:
             return None, None, "length mismatch"
+        base, res = self.check_upload(rnd.model_id, compat, base_json, epoch, spec)
+        if res != "ok":
+            return None, None, res
         if rnd.compat is None:                        # first contribution fixes the cohort's layout
-            rnd.compat, rnd.spec, rnd.length = compat, spec, length
-        elif compat != rnd.compat or length != rnd.length:
+            rnd.compat, rnd.base, rnd.epoch, rnd.spec, rnd.length = compat, base, epoch, spec, length
+        elif compat != rnd.compat or length != rnd.length or epoch != rnd.epoch:
             rnd.failed = True                         # mixed layouts can't cancel coordinate-wise -> void
             return None, None, "compat mismatch"
         rnd.spent_tokens.add(token)                   # reserve now; freed by unreserve() on stream failure
@@ -195,37 +264,33 @@ class Aggregator:
         self._note_contributor(model_id, ip, now)
         return "ok"
 
-    def dp_fold(self, model_id: str, round_id: str, slot: str) -> str:
-        """I/O-bound (run off-thread): per-module fold of ONE staged unmasked dense ΔW (k=1). Reads the
+    def dp_fold(self, model_id: str, base: dict, epoch: int, round_id: str, slot: str) -> str:
+        """I/O-bound (run off-thread): per-module fold of ONE staged unmasked factor Δ (k=1). Reads the
         upload module-by-module from its staged temp object, so nothing is whole in RAM."""
         up = store.open_staged_reader(self.datadir, round_id, slot)
         if up is None or not up.keys:
             return "empty delta"
-        old_reader = store.open_global_reader(self.datadir, model_id)
-        old = old_reader.keys if old_reader is not None else {}
-        for key, (_, shape) in up.keys.items():
-            if len(shape) != 2:
-                return "bad delta"               # dense ΔW is [out, in]
-            if key in old and tuple(old[key][1]) != tuple(shape):
-                return "shape mismatch"          # would corrupt the global's per-coord sum
-        delta_shape = {key: shape for key, (_, shape) in up.keys.items()}
-        return self._fold_streamed(model_id, delta_shape, lambda key, shape: up.read(key), k=1, eta=self.eta_boot)
+        shapes = {key: shape for key, (_, shape) in up.keys.items()}
+        return self._fold_streamed(model_id, base, shapes, lambda key, shape: up.read(key),
+                                   k=1, eta=self.eta_boot, epoch=epoch)
 
-    def submit_dp(self, model_id: str, deltas: dict, ip: str, now: float) -> str:
-        """Sync bootstrap submit (tests / direct use): stage the ΔW then per-module fold. The app instead
+    def submit_dp(self, model_id: str, factors: dict, base: dict, ip: str, now: float) -> str:
+        """Sync bootstrap submit (tests / direct use): stage the factor Δ then fold it. The app instead
         streams the upload straight into the temp object. "ok" or an error/void reason."""
         pre = self.dp_precheck(model_id, ip, now)
         if pre != "ok":
             return pre
-        if not deltas:
-            return "empty delta"
-        from roger_server import delta as delta_mod
+        spec = [(key, tuple(t.shape)) for key, t in factors.items()]
+        checked, res = self.check_upload(model_id, delta.compat_from_shapes(base),
+                                         delta.base_to_json(base), self.state(model_id)["epoch"], spec)
+        if res != "ok":
+            return res
         round_id, slot = "dp-" + uuid.uuid4().hex, "u"
         w = store.stage_writer(self.datadir, round_id, slot)
-        w.write(delta_mod.to_bytes(deltas, model_id))
+        w.write(delta.to_bytes(factors, model_id, {"base": delta.base_to_json(base)}))
         w.commit()
         try:
-            return self.dp_fold(model_id, round_id, slot)
+            return self.dp_fold(model_id, checked, self.state(model_id)["epoch"], round_id, slot)
         finally:
             store.stage_cleanup(self.datadir, round_id)
 
@@ -261,7 +326,7 @@ class Aggregator:
 
     def _module_sum(self, rnd: Round, slots: list, data_starts: dict, key: str, shape: tuple,
                     moff: int, n: int) -> torch.Tensor:
-        """ΣΔW for one module: sum each slot's int64 slice mod R (masks cancel per coord), dequantize."""
+        """ΣΔ for one factor: sum each slot's int64 slice mod R (masks cancel per coord), dequantize."""
         acc = None
         for slot in slots:
             start = data_starts[slot] + moff * 8         # staged "masked" is int64 (8 B/elem)
@@ -271,7 +336,7 @@ class Aggregator:
         return secure_agg.dequantize(acc % secure_agg.R, [(key, tuple(shape))])[key]
 
     def _aggregate_streamed(self, rnd: Round, k: int) -> bool:
-        """Cohort finalize: reconstruct ΣΔW per module from the staged slices, then stream-fold it."""
+        """Cohort finalize: reconstruct ΣΔ per factor from the staged slices, then stream-fold it."""
         slots = list(rnd.staged)
         data_starts = {}
         for slot in slots:
@@ -287,35 +352,61 @@ class Aggregator:
                 n *= d
             offsets[key] = (off, n)
             off += n
-        delta_shape = {key: shape for key, shape in rnd.spec}
+        shapes = {key: shape for key, shape in rnd.spec}
         module = lambda key, shape: self._module_sum(rnd, slots, data_starts, key, shape, *offsets[key])
-        return self._fold_streamed(rnd.model_id, delta_shape, module, k=k, eta=self.eta) == "ok"
+        return self._fold_streamed(rnd.model_id, rnd.base, shapes, module,
+                                   k=k, eta=self.eta, epoch=rnd.epoch) == "ok"
 
-    def _fold_streamed(self, model_id: str, delta_shape: dict, module_delta, *, k: int, eta: float) -> str:
-        """Fold η·mean(ΔW) into the global one module at a time (peak RAM ~one matrix), in a SINGLE pass:
-        stream oldG + (η/k)·ΣΔW while measuring ‖ΣΔW‖, then commit iff within k·clip. An honest clipped
-        cohort always is (triangle ineq); an over-norm aggregate only comes from a client that skipped
-        its clip, so we VOID it (consistent with dropout-void). `module_delta(key, shape)` yields ΣΔW for
-        one module (cohort: summed staged slices; bootstrap: the uploaded tensor)."""
+    def _fold_streamed(self, model_id: str, base: dict, upd_shape: dict, factor_delta, *,
+                       k: int, eta: float, epoch: int | None = None) -> str:
+        """Fold η·mean(Δ) into the epoch's trainable factor, one module at a time (peak RAM ~one factor),
+        in a SINGLE pass: stream the untouched frozen factor + the updated trainable one while measuring
+        ‖ΣΔ‖, then commit iff within k·clip. An honest clipped cohort always is (triangle ineq); an
+        over-norm aggregate only comes from a client that skipped its clip, so we VOID it (consistent
+        with dropout-void). `factor_delta(key, shape)` yields ΣΔ for one factor (cohort: summed staged
+        slices; bootstrap: the uploaded tensor). `epoch` re-checks, now that same-model folds are
+        serialized, that a cohort sealed in one epoch isn't landing in the next."""
+        st = self.state(model_id)
+        if epoch is not None and epoch != st["epoch"]:
+            return "stale epoch"                         # another fold advanced the epoch while we waited
+        if st["compat"] is not None and delta.compat_from_shapes(base) != st["compat"]:
+            return "compat mismatch"
+        cap, suffix = st["rank"], delta.SUFFIX[st["phase"]]
         reader = store.open_global_reader(self.datadir, model_id)
         old = dict(reader.keys) if reader is not None else {}
-        order = sorted(set(old) | set(delta_shape))
-        specs = [(key, "F32", delta_shape[key] if key in delta_shape else old[key][1]) for key in order]
 
-        writer = store.global_writer(self.datadir, model_id, specs)
+        order = []                                       # every module carries BOTH factors, A first
+        for module in sorted(base):
+            out_dim, in_dim = base[module]
+            rank = delta.rank_for(out_dim, in_dim, cap)
+            order.append((module + delta.LORA_A, (rank, in_dim)))
+            order.append((module + delta.LORA_B, (out_dim, rank)))
+        folds = st["folds"] + 1
+        advance = folds >= self.epoch_folds              # the trained factor swaps at the epoch boundary
+        new_epoch = st["epoch"] + 1 if advance else st["epoch"]
+        meta = {"rank": str(cap), "epoch": str(new_epoch), "phase": delta.phase_of(new_epoch),
+                "folds": "0" if advance else str(folds),
+                "scaling": "1"}                          # the scale is already inside the factors
+        writer = store.global_writer(self.datadir, model_id, [(key, "F32", shape) for key, shape in order],
+                                     meta)
         sq, coef = 0.0, eta / k
         try:
-            for key in order:
-                base = reader.read(key).float() if (reader is not None and key in old) else None
-                if key in delta_shape:
-                    dW = module_delta(key, delta_shape[key]).float()
-                    if not torch.isfinite(dW).all():
+            for key, shape in order:
+                if key in old:
+                    val = reader.read(key).float()
+                elif key.endswith(delta.LORA_A):
+                    # A fresh federation's frozen A is derived, not contributed, so a cold client can
+                    # train its ΔB against the very A that lands here (delta.init_A).
+                    val = delta.init_A(model_id, delta.module_of(key), shape[0], shape[1])
+                else:
+                    val = torch.zeros(shape)             # LoRA starts at B = 0
+                if key.endswith(suffix) and key in upd_shape:
+                    d = factor_delta(key, shape).float()
+                    if not torch.isfinite(d).all():
                         writer.abort()
                         return "non-finite delta"        # void: global untouched
-                    sq += float((dW ** 2).sum())
-                    val = coef * dW if base is None else base + coef * dW
-                else:
-                    val = base                           # old-only module -> carried over unchanged
+                    sq += float((d ** 2).sum())
+                    val = val + coef * d
                 writer.write(val.contiguous().to(torch.float32).numpy().tobytes())
         except Exception:
             writer.abort()
@@ -324,13 +415,16 @@ class Aggregator:
             writer.abort()
             return "norm exceeded"
         writer.commit(store.load_version(self.datadir, model_id) + 1)
+        self._state[model_id] = {"epoch": new_epoch, "phase": delta.phase_of(new_epoch),
+                                 "folds": 0 if advance else folds, "rank": cap,
+                                 "compat": delta.compat_from_shapes(base)}
         return "ok"
 
     # --- broadcast --------------------------------------------------------------------------
 
     def serve_global(self, model_id: str, since: str):
-        """(chunk_iter, version) for the cumulative global, or None when nothing newer than `since`
-        (cursor == version) or no global yet. The stream is exactly what the client folds."""
+        """(chunk_iter, version) for the global LoRA adapter, or None when nothing newer than `since`
+        (cursor == version) or no global yet. The stream is exactly what the client attaches."""
         version = store.load_version(self.datadir, model_id)
         if version == 0 or since == str(version):
             return None
