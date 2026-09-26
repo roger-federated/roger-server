@@ -1,10 +1,13 @@
 """app.py — FastAPI wire layer for the aggregation server.
 
 Endpoints the client's transport.py speaks:
-  GET  /status?model_id=  -> {mode, models, k_min, k_target, min_client, latest_client, rank, epoch, phase}
+  GET  /status?model_id=  -> {mode, models, aliases, k_min, k_target, min_client, latest_client, rank,
+                         epoch, phase}
                          (which regime to use, see aggregate.mode(); `models` = the ROGER_AGG_MODELS
                          allowlist, null when any model is accepted, so a client can tell its user which
-                         models to run; min_client/latest_client advertise the client protocol
+                         models to run; `aliases` = {canonical id: [repo ids of the same weights]} from
+                         aliases.py, which the client resolves its runtime's model against before it
+                         stamps the canonical id; min_client/latest_client advertise the client protocol
                          version this deployment requires/prefers — ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT,
                          both default 0 = no opinion — so an out-of-date client self-skips + nudges an
                          update; `rank`/`epoch`/`phase` are the factor state the client must train
@@ -40,7 +43,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from roger_server import store
+from roger_server import aliases, store
 from roger_server.aggregate import Aggregator
 
 _STAGE_BATCH = 8 << 20                 # bytes buffered before an off-thread store write (caps RAM/upload)
@@ -120,7 +123,9 @@ def create_app(aggregator: Aggregator | None = None) -> FastAPI:
                     # The allowlist itself (null = any model): a bare "unsupported" isn't actionable for
                     # the runtime wrapper, which only knows the runtime's own name for its model (a gguf
                     # path, an alias) and needs the accepted HF ids to match against and to show the user.
-                    "models": sorted(agg.allowlist) if agg.allowlist is not None else None}
+                    "models": sorted(agg.allowlist) if agg.allowlist is not None else None,
+                    # Curated builds of those models (quants, reuploads) that count as the same weights.
+                    "aliases": aliases.advertised(agg.allowlist)}
 
     @app.get("/healthz")
     async def healthz():

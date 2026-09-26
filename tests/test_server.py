@@ -462,6 +462,28 @@ def test_allowlist_reports_unsupported(tmp_path):
     print("PASS test_allowlist_reports_unsupported")
 
 
+def test_status_advertises_aliases(tmp_path):
+    # /status carries the curated builds of each ACCEPTED canonical id, so a client serving a quant can
+    # map it back to the id it must stamp; canonicals this deployment doesn't accept are left out, and
+    # with no allowlist the whole table is served (else every quant would found a global of its own).
+    from fastapi.testclient import TestClient
+    from roger_server import aliases
+    from roger_server.app import create_app
+    gemma = "google/gemma-4-12B-it"
+    with TestClient(create_app(_agg(tmp_path, allowlist={gemma, "ok"}))) as client:
+        body = client.get("/status", params={"model_id": gemma}).json()
+    assert set(body["aliases"]) == {gemma}
+    assert "mlx-community/gemma-4-12B-it-OptiQ-4bit" in body["aliases"][gemma]
+    # QAT is a different weight set (its own canonical), never an alias of the release.
+    assert not any("qat" in a.lower() for a in body["aliases"][gemma])
+    with TestClient(create_app(_agg(tmp_path, allowlist=None))) as client:
+        assert set(client.get("/status").json()["aliases"]) == set(aliases.ALIASES)
+    # An alias belongs to exactly one canonical, and is never itself a canonical.
+    flat = [a.lower() for al in aliases.ALIASES.values() for a in al]
+    assert len(flat) == len(set(flat)) and not set(flat) & {c.lower() for c in aliases.ALIASES}
+    print("PASS test_status_advertises_aliases")
+
+
 def test_status_advertises_client_version(tmp_path, monkeypatch):
     # /status echoes the deployment's client-version policy (ROGER_MIN_CLIENT / ROGER_LATEST_CLIENT) so
     # an out-of-date client self-skips + nudges an update. Absent env ⇒ 0 (no opinion), never blocks.
@@ -602,6 +624,6 @@ if __name__ == "__main__":
     test_dp_bootstrap_accumulates(d / "i"); test_dp_bootstrap_norm_bound_and_rejects(d / "j")
     test_mode_flips_at_density_threshold(d / "k"); test_defaults(d / "l")
     test_absent_global(d / "m"); test_dp_bootstrap_bf16(d / "n")
-    test_allowlist_reports_unsupported(d / "o"); test_epoch_swaps_the_trained_factor(d / "p")
+    test_allowlist_reports_unsupported(d / "o"); test_status_advertises_aliases(d / "o2"); test_epoch_swaps_the_trained_factor(d / "p")
     test_per_module_rank_map(d / "s")
     test_late_cohort_voids_across_an_epoch_boundary(d / "q"); test_seeded_A_is_stable_and_shaped(d / "r")

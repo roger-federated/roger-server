@@ -66,6 +66,9 @@ client.
   `rank`/`epoch`/`folds`) + per-round upload staging; per-module reader / multipart `GlobalWriter` /
   streamed broadcast; `fs` + `s3` backends (`ROGER_SERVER_STORAGE`).
 - `roger_server/secure_agg.py`, `roger_server/delta.py` — the mirrored client contract (above).
+- `roger_server/aliases.py` — the curated table of repos accepted as the same weights as a canonical id
+  (quants, reuploads; QAT is its own canonical), served at `/status` as `aliases`. Hand-verified, never
+  name-inferred: the hub is full of same-named forks. Uploads/allowlist stay canonical-only.
 - `roger_server/__main__.py` — `python -m roger_server` (uvicorn).
 - `Dockerfile`, `README.md` — scale-to-zero container deploy (the README is also the deploy guide).
 - `tests/test_server.py` — CPU-only, download-free; simulates clients with the real `secure_agg` crypto
